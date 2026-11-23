@@ -95,6 +95,27 @@ class HTTPVLLMWeightSyncClient:
         )
         self._post("finish_weight_update", json)
 
+    def start_lora_weight_update(self, request: dict[str, Any]) -> None:
+        self._post("start_lora_weight_update", {"request": request})
+
+    def update_lora_weights(self, update_info: WeightTransferUpdatePayload) -> None:
+        self._post(
+            "update_lora_weights",
+            {"update_info": _json_safe_update_payload(update_info)},
+        )
+
+    def finish_lora_weight_update(self, update_id: str | None = None) -> None:
+        self._post(
+            "finish_lora_weight_update",
+            {"update_id": update_id} if update_id is not None else None,
+        )
+
+    def abort_lora_weight_update(self, update_id: str | None = None) -> None:
+        self._post(
+            "abort_lora_weight_update",
+            {"update_id": update_id} if update_id is not None else None,
+        )
+
 
 class RayVLLMWeightSyncClient:
     """Talks to one or more vLLM `AsyncLLM`/`LLM` Ray actors.
@@ -136,3 +157,24 @@ class RayVLLMWeightSyncClient:
             ray.get(
                 [h.update_weight_version.remote(weight_version) for h in self.handles]
             )
+
+    def start_lora_weight_update(self, request: dict[str, Any]) -> None:
+        import ray
+
+        ray.get([h.start_lora_weight_update.remote(request) for h in self.handles])
+
+    def update_lora_weights(self, update_info: WeightTransferUpdatePayload) -> None:
+        import ray
+
+        request = WeightTransferUpdateRequest(update_info=update_info)
+        ray.get([h.update_lora_weights.remote(request) for h in self.handles])
+
+    def finish_lora_weight_update(self, update_id: str | None = None) -> None:
+        import ray
+
+        ray.get([h.finish_lora_weight_update.remote(update_id) for h in self.handles])
+
+    def abort_lora_weight_update(self, update_id: str | None = None) -> None:
+        import ray
+
+        ray.get([h.abort_lora_weight_update.remote(update_id) for h in self.handles])

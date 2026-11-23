@@ -4,6 +4,7 @@
 from asyncio import Lock
 from collections import defaultdict
 from http import HTTPStatus
+from typing import Any
 
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
@@ -23,6 +24,7 @@ from vllm.exceptions import LoRAAdapterNotFoundError
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.lora.resolver import LoRAResolver, LoRAResolverRegistry
+from vllm.lora.weight_update import LoRAWeightUpdateRequest
 from vllm.utils.counter import AtomicCounter
 
 logger = init_logger(__name__)
@@ -116,6 +118,9 @@ class OpenAIServingModels:
                 LoRAResolverRegistry.get_resolver(lora_resolver_name)
             )
         self.lora_resolver_lock: dict[str, Lock] = defaultdict(Lock)
+        self._pending_lora_weight_update: LoRAWeightUpdateRequest | None = None
+        self._last_lora_weight_update: LoRAWeightUpdateRequest | None = None
+        self._lora_weight_update_names: dict[int, str] = {}
 
         self.model_config = self.engine_client.model_config
         self.renderer = self.engine_client.renderer
@@ -247,9 +252,111 @@ class OpenAIServingModels:
             logger.info("Removed LoRA adapter: name '%s'", lora_name)
             return f"Success: LoRA adapter '{lora_name}' removed successfully."
 
+    async def start_lora_weight_update(self, request: dict[str, Any]) -> None:
+        """Reserve an adapter identity before starting its IPC update.
+
+        If failed-start cleanup is not acknowledged, explicitly abort this
+        update before retrying. An existing owner cannot be preempted.
+        """
+        update = LoRAWeightUpdateRequest(**request)
+        async with self.lora_resolver_lock[update.lora_name]:
+            if self._pending_lora_weight_update is not None:
+                raise ValueError("A LoRA weight update is already active")
+            if self.is_base_model(update.lora_name):
+                raise ValueError("A LoRA adapter cannot use a base model name")
+            existing = self.lora_requests.get(update.lora_name)
+            if existing is not None:
+                if existing.lora_int_id != update.lora_int_id:
+                    raise ValueError("A loaded adapter must keep its existing ID")
+            elif (
+                update.lora_int_id <= self.lora_id_counter.value
+                and self._lora_weight_update_names.get(update.lora_int_id)
+                != update.lora_name
+            ):
+                raise ValueError("A new adapter must use an unused LoRA ID")
+            if any(
+                adapter.lora_int_id == update.lora_int_id
+                and adapter.lora_name != update.lora_name
+                for adapter in self.lora_requests.values()
+            ):
+                raise ValueError("The LoRA ID belongs to another adapter")
+            self.lora_id_counter.inc(
+                max(0, update.lora_int_id - self.lora_id_counter.value)
+            )
+            self._lora_weight_update_names[update.lora_int_id] = update.lora_name
+            self._pending_lora_weight_update = update
+            try:
+                await self.engine_client.start_lora_weight_update(request)
+            except Exception:
+                try:
+                    await self.engine_client.abort_lora_weight_update(update.update_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to abort LoRA update after start failed; "
+                        "explicitly abort update %r before retrying",
+                        update.update_id,
+                    )
+                else:
+                    self._pending_lora_weight_update = None
+                raise
+
+    async def finish_lora_weight_update(
+        self, update_id: str | None = None
+    ) -> LoRAWeightUpdateRequest:
+        """Publish the served model name only after all workers commit."""
+        update = self._pending_lora_weight_update
+        if update is None:
+            if self._last_lora_weight_update is not None and (
+                update_id is None
+                or update_id == self._last_lora_weight_update.update_id
+            ):
+                return self._last_lora_weight_update
+            raise ValueError("Start a LoRA weight update first")
+        if update_id is not None and update_id != update.update_id:
+            raise ValueError("update_id does not match the active LoRA update")
+        async with self.lora_resolver_lock[update.lora_name]:
+            if self._pending_lora_weight_update is not update:
+                if self._last_lora_weight_update is update:
+                    return update
+                raise ValueError(
+                    "The LoRA weight update changed while awaiting its lock"
+                )
+            await self.engine_client.finish_lora_weight_update(update.update_id)
+            self.lora_requests[update.lora_name] = update.to_lora_request()
+            self._last_lora_weight_update = update
+            self._pending_lora_weight_update = None
+            return update
+
+    async def abort_lora_weight_update(self, update_id: str | None = None) -> None:
+        """Discard the pending version without changing the served identity."""
+        update = self._pending_lora_weight_update
+        if update is None:
+            raise ValueError("No LoRA weight update is active")
+        if update_id is not None and update_id != update.update_id:
+            raise ValueError("update_id does not match the active LoRA update")
+        async with self.lora_resolver_lock[update.lora_name]:
+            if self._pending_lora_weight_update is not update:
+                raise ValueError(
+                    "The LoRA weight update changed while awaiting its lock"
+                )
+            await self.engine_client.abort_lora_weight_update(update.update_id)
+            self._pending_lora_weight_update = None
+
     async def _check_load_lora_adapter_request(
         self, request: LoadLoRAAdapterRequest
     ) -> ErrorResponse | None:
+        if self._pending_lora_weight_update is not None:
+            return create_error_response(
+                message="Finish or abort the active LoRA weight update first.",
+                err_type="InvalidUserInput",
+                status_code=HTTPStatus.CONFLICT,
+            )
+        if request.lora_name in self._lora_weight_update_names.values():
+            return create_error_response(
+                message="IPC LoRA adapters must be updated through IPC weight updates.",
+                err_type="InvalidUserInput",
+                status_code=HTTPStatus.CONFLICT,
+            )
         # Check if both 'lora_name' and 'lora_path' are provided
         if not request.lora_name or not request.lora_path:
             return create_error_response(
@@ -282,6 +389,18 @@ class OpenAIServingModels:
     async def _check_unload_lora_adapter_request(
         self, request: UnloadLoRAAdapterRequest
     ) -> ErrorResponse | None:
+        if self._pending_lora_weight_update is not None:
+            return create_error_response(
+                message="Finish or abort the active LoRA weight update first.",
+                err_type="InvalidUserInput",
+                status_code=HTTPStatus.CONFLICT,
+            )
+        if request.lora_name in self._lora_weight_update_names.values():
+            return create_error_response(
+                message="IPC LoRA adapters remain pinned for the engine lifetime.",
+                err_type="InvalidUserInput",
+                status_code=HTTPStatus.CONFLICT,
+            )
         # Check if 'lora_name' is not provided return an error
         if not request.lora_name:
             return create_error_response(

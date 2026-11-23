@@ -141,6 +141,11 @@ class EngineCore:
         self._checkpoint_error: str | None = None
         # Whether the workers' extensible KV cache holds nothing to keep.
         self._kv_cache_reclaimable = False
+        # Startup can dispatch collective RPCs while profiling the model.
+        self._lora_weight_update_active = False
+        self._lora_weight_update_id: str | None = None
+        self._lora_weight_update_resume_on_finish = False
+        self._lora_weight_update_commit_failed = False
 
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
@@ -1085,6 +1090,12 @@ class EngineCore:
 
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
+        if self._lora_weight_update_commit_failed:
+            raise RuntimeError("A LoRA commit failed; restart the inference engine")
+        if self._lora_weight_update_active:
+            raise RuntimeError("Finish or abort the LoRA update before resuming")
+        if any(self.model_executor.collective_rpc("has_incomplete_weight_update")):
+            raise RuntimeError("Cannot resume with an incomplete weight update")
         if not self._checkpoint_state.is_restored:
             raise RuntimeError(
                 f"Cannot resume scheduling while the checkpoint state is "
@@ -1130,6 +1141,8 @@ class EngineCore:
                 `LLM.sleep`.
 
         """
+        if self._lora_weight_update_active:
+            raise RuntimeError("Cannot sleep during a LoRA weight update")
         if self._checkpoint_state != CheckpointState.RUNNING:
             raise RuntimeError(
                 f"Cannot sleep while the checkpoint state is {self._checkpoint_state}"
@@ -1199,6 +1212,8 @@ class EngineCore:
         and all executor memory to be resident. Kept requests are recomputed
         after wake-up. `reset_connector` is as for `sleep`.
         """
+        if self._lora_weight_update_active:
+            raise RuntimeError("Cannot release KV cache memory during a LoRA update")
         if not (
             self.is_scheduler_paused()
             and not self.scheduler.has_requests()
@@ -1241,9 +1256,13 @@ class EngineCore:
         return self.collective_rpc("compute_weight_checksums")
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
+        if self._lora_weight_update_active:
+            raise RuntimeError("Cannot load an adapter during a LoRA weight update")
         return self.model_executor.add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
+        if self._lora_weight_update_active:
+            raise RuntimeError("Cannot unload an adapter during a LoRA weight update")
         return self.model_executor.remove_lora(lora_id)
 
     def list_loras(self) -> set[int]:
@@ -1269,7 +1288,128 @@ class EngineCore:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        if self._lora_weight_update_commit_failed and method in (
+            "start_lora_weight_update",
+            "update_lora_weights",
+            "prepare_lora_weight_update",
+            "commit_lora_weight_update",
+            "abort_lora_weight_update",
+        ):
+            raise RuntimeError("A LoRA commit failed; restart the inference engine")
+        if method in (
+            "prepare_lora_weight_update",
+            "commit_lora_weight_update",
+            "abort_lora_weight_update",
+        ):
+            update_id = (kwargs or {}).get("update_id", args[0] if args else None)
+            # A rejected start may never have reserved an owner. Its caller
+            # can still require every worker to acknowledge that ID's abort.
+            allow_unowned_abort = (
+                method == "abort_lora_weight_update"
+                and not self._lora_weight_update_active
+                and isinstance(update_id, str)
+                and bool(update_id.strip())
+            )
+            if (
+                update_id is not None
+                and not allow_unowned_abort
+                and (
+                    not self._lora_weight_update_active
+                    or update_id != self._lora_weight_update_id
+                )
+            ):
+                raise ValueError("update_id does not match the active LoRA update")
+
+        if method == "start_lora_weight_update":
+            if self._lora_weight_update_active:
+                raise RuntimeError("A LoRA weight update is already active")
+            from vllm.lora.weight_update import LoRAWeightUpdateRequest
+
+            start_request = (kwargs or {}).get("request", args[0] if args else {})
+            update = LoRAWeightUpdateRequest(**start_request)
+            config = self.vllm_config
+            if config.lora_config is None:
+                raise ValueError("IPC LoRA updates require enable_lora=True")
+            parallel = config.parallel_config
+            if parallel.data_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+                raise ValueError("IPC LoRA updates require DP=1 and PP=1")
+            if config.weight_transfer_config is None:
+                raise ValueError(
+                    "Configured weight transfer backend does not support "
+                    "LoRA weight updates"
+                )
+            capabilities = self.model_executor.collective_rpc(
+                "supports_lora_weight_updates"
+            )
+            if not capabilities or not all(capabilities):
+                raise ValueError(
+                    "Configured weight transfer backend does not support "
+                    "LoRA weight updates"
+                )
+            if self.model_executor.is_sleeping:
+                raise RuntimeError("Wake the engine before updating LoRA")
+            if self._checkpoint_state != CheckpointState.RUNNING:
+                raise RuntimeError("Cannot update LoRA during a process checkpoint")
+            if self.scheduler.has_requests() or self.batch_queue:
+                raise RuntimeError("Drain all generation requests before updating LoRA")
+            if any(self.model_executor.collective_rpc("has_incomplete_weight_update")):
+                raise RuntimeError("Cannot start LoRA with an incomplete weight update")
+            self._lora_weight_update_resume_on_finish = not self.is_scheduler_paused()
+            if self._lora_weight_update_resume_on_finish:
+                self.pause_scheduler(mode="keep", clear_cache=False)
+            self._reset_caches()
+            self.model_executor.collective_rpc("synchronize_device")
+            self._lora_weight_update_active = True
+            self._lora_weight_update_id = update.update_id
+        elif method in (
+            "update_lora_weights",
+            "prepare_lora_weight_update",
+            "commit_lora_weight_update",
+        ):
+            if not self._lora_weight_update_active:
+                raise RuntimeError("Start a LoRA weight update first")
+        elif self._lora_weight_update_active and method in (
+            "start_weight_update",
+            "start_draft_weight_update",
+            "init_weight_transfer_engine",
+            "shutdown_weight_transfer_engine",
+            "add_lora",
+            "remove_lora",
+            "remove_all_loras",
+        ):
+            raise RuntimeError(f"Cannot call {method} during a LoRA weight update")
+
+        try:
+            result = self.model_executor.collective_rpc(method, timeout, args, kwargs)
+        except Exception:
+            if method == "commit_lora_weight_update":
+                # A lost response cannot distinguish a rejected commit from
+                # weights installed on only some workers. Never resume after
+                # that uncertainty, even if all workers acknowledge abort.
+                self._lora_weight_update_commit_failed = True
+            elif method == "start_lora_weight_update":
+                # Start may have succeeded on only some workers. Release this
+                # newly reserved owner only after every worker acknowledges
+                # abort; a failed cleanup must leave inference unavailable.
+                try:
+                    self.collective_rpc(
+                        "abort_lora_weight_update",
+                        timeout=timeout,
+                        kwargs={"update_id": self._lora_weight_update_id},
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to abort LoRA update after start failed; "
+                        "inference remains paused"
+                    )
+            raise
+        if method in ("commit_lora_weight_update", "abort_lora_weight_update"):
+            self._lora_weight_update_active = False
+            self._lora_weight_update_id = None
+            if self._lora_weight_update_resume_on_finish:
+                self.resume_scheduler()
+                self._lora_weight_update_resume_on_finish = False
+        return result
 
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
@@ -2507,6 +2647,8 @@ class EngineCoreProc(EngineCore):
             Why the engine cannot prepare, with nothing changed, or None.
 
         """
+        if self._lora_weight_update_active:
+            return "Cannot prepare a checkpoint during a LoRA weight update"
         state = self._checkpoint_state
         if state in (CheckpointState.PREPARING, CheckpointState.PREPARED):
             return None

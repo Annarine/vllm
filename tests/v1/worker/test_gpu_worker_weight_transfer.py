@@ -7,8 +7,6 @@ delegates to the configured weight transfer engine and tracks whether an update
 session is active. These tests verify that delegation and the session guard.
 """
 
-from contextlib import ExitStack
-
 import pytest
 import torch
 import torch.nn as nn
@@ -79,14 +77,13 @@ class _RecordingModelRunner:
 
 
 def _make_worker(engine: _RecordingEngine | None) -> Worker:
-    worker = object.__new__(Worker)
-    worker.vllm_config = VllmConfig()
+    worker = Worker(
+        vllm_config=VllmConfig(),
+        local_rank=0,
+        rank=0,
+        distributed_init_method="tcp://127.0.0.1:29500",
+    )
     worker.weight_transfer_engine = engine
-    worker._weight_update_active = False
-    worker._incomplete_weight_updates = set()
-    worker._weight_update_is_draft = False
-    worker._kv_cache_reclaimable = False
-    worker._weight_update_kv_cache_loan = ExitStack()
     worker.model_runner = _RecordingModelRunner()
     return worker
 

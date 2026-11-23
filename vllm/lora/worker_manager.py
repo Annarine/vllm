@@ -10,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.config.lora import LoRAConfig
 from vllm.exceptions import LoRAAdapterNotFoundError
 from vllm.logger import init_logger
+from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.model_manager import (
     LoRAModelManager,
@@ -17,7 +18,7 @@ from vllm.lora.model_manager import (
     create_lora_manager,
 )
 from vllm.lora.peft_helper import PEFTHelper
-from vllm.lora.request import LoRARequest
+from vllm.lora.request import LoRARequest, _TensorLoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
@@ -103,7 +104,9 @@ class WorkerLoRAManager:
         self._adapter_manager = lora_manager
         return lora_manager.model
 
-    def _load_adapter(self, lora_request: LoRARequest) -> LoRAModel:
+    def _load_adapter(
+        self, lora_request: LoRARequest, *, device: torch.device | str = "cpu"
+    ) -> LoRAModel:
         try:
             supported_lora_modules = self._adapter_manager.supported_lora_modules
             packed_modules_mapping = self._adapter_manager.packed_modules_mapping
@@ -116,11 +119,26 @@ class WorkerLoRAManager:
                 if module == "experts":
                     expected_lora_lst.append(module)
             expected_lora_modules = set(expected_lora_lst)
-            lora_path = get_adapter_absolute_path(lora_request.lora_path)
-
-            peft_helper = PEFTHelper.from_local_dir(
-                lora_path, self.max_position_embeddings
-            )
+            if isinstance(lora_request, _TensorLoRARequest):
+                logger.warning_once(
+                    "Loading LoRA from tensors is a private, worker-local interface "
+                    "for internal framework integration and may change without "
+                    "notice. "
+                    "The caller must synchronize updates and invalidate stale "
+                    "KV caches."
+                )
+                assert lora_request._peft_config is not None
+                peft_helper = PEFTHelper.from_dict(
+                    {
+                        **lora_request._peft_config,
+                        "vllm_max_position_embeddings": self.max_position_embeddings,
+                    }
+                )
+            else:
+                lora_path = get_adapter_absolute_path(lora_request.lora_path)
+                peft_helper = PEFTHelper.from_local_dir(
+                    lora_path, self.max_position_embeddings
+                )
 
             # Validates the LoRA configuration against requirements before
             # loading weights, throwing an exception if validation fails.
@@ -137,19 +155,35 @@ class WorkerLoRAManager:
             # Get model-defined prefixes to skip during LoRA loading.
             lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None)
 
-            lora = self._lora_model_cls.from_local_checkpoint(
-                lora_path,
-                expected_lora_modules,
-                peft_helper=peft_helper,
-                lora_model_id=lora_request.lora_int_id,
-                device="cpu",
-                dtype=self.lora_config.lora_dtype,
-                model_vocab_size=self.vocab_size,
-                weights_mapper=hf_to_vllm_mapper,
-                skip_prefixes=lora_skip_prefixes,
-                moe_ep_spec=self._adapter_manager.moe_ep_load_spec,
-                unsupported_lora_modules=self._adapter_manager.unsupported_lora_modules,
-            )
+            if isinstance(lora_request, _TensorLoRARequest):
+                assert lora_request._lora_tensors is not None
+                lora = self._lora_model_cls.from_lora_tensors(
+                    lora_model_id=lora_request.lora_int_id,
+                    tensors=lora_request._lora_tensors,
+                    peft_helper=peft_helper,
+                    device=str(device),
+                    dtype=self.lora_config.lora_dtype,
+                    model_vocab_size=self.vocab_size,
+                    weights_mapper=hf_to_vllm_mapper,
+                    skip_prefixes=lora_skip_prefixes,
+                    expected_lora_modules=expected_lora_modules,
+                    moe_ep_spec=self._adapter_manager.moe_ep_load_spec,
+                    unsupported_lora_modules=self._adapter_manager.unsupported_lora_modules,
+                )
+            else:
+                lora = self._lora_model_cls.from_local_checkpoint(
+                    lora_path,
+                    expected_lora_modules,
+                    peft_helper=peft_helper,
+                    lora_model_id=lora_request.lora_int_id,
+                    device="cpu",
+                    dtype=self.lora_config.lora_dtype,
+                    model_vocab_size=self.vocab_size,
+                    weights_mapper=hf_to_vllm_mapper,
+                    skip_prefixes=lora_skip_prefixes,
+                    moe_ep_spec=self._adapter_manager.moe_ep_load_spec,
+                    unsupported_lora_modules=self._adapter_manager.unsupported_lora_modules,
+                )
             # Stamp the on-disk MoE layout onto the loaded model so the
             # adapter manager can route 3D-format checkpoints through the
             # 3D->2D conversion when running under the universal 2D wrapper.
@@ -172,6 +206,93 @@ class WorkerLoRAManager:
             raise e
 
         return lora
+
+    def prepare_tensor_adapter(self, lora_request: _TensorLoRARequest) -> LoRAModel:
+        """Build an adapter from worker-owned tensors without installing it."""
+        if not isinstance(self._adapter_manager, LRUCacheLoRAModelManager):
+            raise ValueError("Tensor weight updates require an LRU LoRA manager.")
+        for cache, capacity in (
+            (
+                self._adapter_manager._registered_adapters,
+                self._adapter_manager.capacity,
+            ),
+            (self._adapter_manager._active_adapters, self._adapter_manager.lora_slots),
+        ):
+            if (
+                lora_request.lora_int_id not in cache
+                and len(cache.pinned_items) >= capacity
+            ):
+                raise ValueError("No unpinned LoRA cache slot is available for update.")
+        with gpu_sync_allowed():
+            lora = self._load_adapter(lora_request, device=self.device)
+            self._validate_tensor_adapter_shapes(lora)
+            self._adapter_manager._create_merged_loras_inplace(lora)
+            for weights in lora.loras.values():
+                for tensors in (weights.lora_a, weights.lora_b):
+                    tensors = tensors if isinstance(tensors, list) else [tensors]
+                    for tensor in tensors:
+                        if tensor is not None and not bool(
+                            torch.isfinite(tensor).all()
+                        ):
+                            raise ValueError(
+                                "LoRA normalization produced nonfinite values."
+                            )
+        return lora
+
+    def _validate_tensor_adapter_shapes(self, lora: LoRAModel) -> None:
+        """Accept full A/B weights only for wrapped ordinary linear layers."""
+        manager = self._adapter_manager
+        matched: set[str] = set()
+        for module_name, module in manager.modules.items():
+            names = manager.packed_modules.get(module_name, [module_name])
+            for i, name in enumerate(names):
+                weights = manager._get_lora_layer_weights(lora, name)
+                if weights is None:
+                    continue
+                if not isinstance(module, BaseLinearLayerWithLoRA):
+                    raise ValueError(
+                        "LoRA weight updates require ordinary linear layers; "
+                        "expert layers are unsupported."
+                    )
+                base = module.base_layer
+                output_size = base.output_size
+                if hasattr(base, "total_num_kv_heads"):
+                    sizes = [
+                        base.total_num_heads * base.head_size,
+                        base.total_num_kv_heads * base.head_size,
+                        base.total_num_kv_heads * base.v_head_size,
+                    ]
+                    output_size = sizes[i] if len(names) == 3 else sum(sizes)
+                elif len(names) > 1:
+                    output_size = base.output_sizes[i]
+                a_shape = (weights.rank, base.input_size)
+                b_shape = (output_size, weights.rank)
+                if (
+                    tuple(weights.lora_a.shape) != a_shape
+                    or tuple(weights.lora_b.shape) != b_shape
+                ):
+                    raise ValueError(
+                        f"LoRA module {name!r} requires full A/B shapes "
+                        f"{a_shape}/{b_shape}, received "
+                        f"{tuple(weights.lora_a.shape)}/{tuple(weights.lora_b.shape)}."
+                    )
+                matched.add(weights.module_name)
+        unmatched = set(lora.loras) - matched
+        if unmatched:
+            raise ValueError(
+                f"LoRA tensors do not match model layers: {sorted(unmatched)}"
+            )
+
+    def install_prepared_adapter(self, lora: LoRAModel) -> None:
+        """Replace an adapter while generation is paused, and keep it resident."""
+        with gpu_sync_allowed():
+            self._adapter_manager.remove_adapter(lora.id)
+            if len(self._adapter_manager) >= self._adapter_manager.capacity:
+                assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
+                self._adapter_manager.remove_oldest_adapter()
+            self._adapter_manager.add_adapter(lora)
+            self._adapter_manager.activate_adapter(lora.id)
+            self._adapter_manager.pin_adapter(lora.id)
 
     def add_dummy_lora(self, lora_request: LoRARequest, rank: int) -> bool:
         if lora_request.lora_int_id in self.list_adapters():

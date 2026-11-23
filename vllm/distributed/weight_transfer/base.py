@@ -450,6 +450,15 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
 
     supports_draft_weight_update: bool = True
 
+    @property
+    def supports_lora_weight_updates(self) -> bool:
+        """Whether the configured transport can receive a LoRA revision.
+
+        Supporting backends must implement `receive_tensors` without loading
+        tensors into the base model. The value may depend on wire parameters.
+        """
+        return False
+
     defers_processing: bool = False
     """Whether `update_weights` returns before the weights are on the device.
 
@@ -597,6 +606,19 @@ class WeightTransferEngine(ABC, Generic[TInitInfo, TUpdateInfo]):
         # next step uses the new weights.
         torch.accelerator.synchronize()
 
+    def receive_tensors(
+        self, update_info: TUpdateInfo
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Receive tensors without changing model weights.
+
+        Returned storage may alias the sender or a reusable transport buffer.
+        Consumers must take ownership before retaining or transforming tensors.
+        Backends opt into this interface through `supports_lora_weight_updates`.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support receiving LoRA tensors"
+        )
+
     @abstractmethod
     def receive_weights(self, update_info: TUpdateInfo) -> None:
         """Receive weights from the trainer and load them into the model.
@@ -640,6 +662,18 @@ class VLLMWeightSyncClient(Protocol):
     def update_weights(self, update_info: WeightTransferUpdatePayload) -> None: ...
 
     def finish_weight_update(self, weight_version: str | None = None) -> None: ...
+
+
+class VLLMLoRAWeightSyncClient(VLLMWeightSyncClient, Protocol):
+    """Control plane for complete adapter updates, separate from model reloads."""
+
+    def start_lora_weight_update(self, request: dict[str, Any]) -> None: ...
+
+    def update_lora_weights(self, update_info: WeightTransferUpdatePayload) -> None: ...
+
+    def finish_lora_weight_update(self, update_id: str | None = None) -> None: ...
+
+    def abort_lora_weight_update(self, update_id: str | None = None) -> None: ...
 
 
 class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):

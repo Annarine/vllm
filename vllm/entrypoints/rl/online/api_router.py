@@ -8,12 +8,14 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from vllm import envs
 from vllm.distributed.weight_transfer.base import (
     WeightTransferInitRequest,
     WeightTransferUpdatePayload,
     WeightTransferUpdateRequest,
 )
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.rl.online.metrics import weight_operation_metrics
 from vllm.logger import init_logger
 from vllm.v1.engine import PauseMode
@@ -23,6 +25,19 @@ logger = init_logger(__name__)
 
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
+
+
+def lora_models(request: Request) -> OpenAIServingModels:
+    if not envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
+        raise HTTPException(
+            status_code=400,
+            detail="IPC LoRA updates require VLLM_ALLOW_RUNTIME_LORA_UPDATING=1",
+        )
+    if engine_client(request).vllm_config.parallel_config._api_process_count != 1:
+        raise HTTPException(
+            status_code=400, detail="IPC LoRA updates require api_server_count=1"
+        )
+    return request.app.state.openai_serving_models
 
 
 router = APIRouter()
@@ -221,6 +236,68 @@ async def update_weight_version(
 ):
     await engine_client(raw_request).update_weight_version(new_version)
     return JSONResponse(content={"success": True, "new_version": new_version})
+
+
+@router.post("/start_lora_weight_update")
+async def start_lora_weight_update(
+    raw_request: Request,
+    request: Annotated[dict[str, Any], Body(embed=True)],
+):
+    """Drain generation and begin an IPC LoRA update."""
+    try:
+        with weight_operation_metrics().record("start"):
+            await lora_models(raw_request).start_lora_weight_update(request)
+    except (TypeError, ValueError) as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    return JSONResponse(content={"message": "LoRA weight update started"})
+
+
+@router.post("/update_lora_weights")
+async def update_lora_weights(
+    raw_request: Request,
+    update_info: Annotated[WeightTransferUpdatePayload, Body(embed=True)],
+):
+    """Receive CUDA IPC tensors for the active LoRA update."""
+    lora_models(raw_request)
+    with weight_operation_metrics().record("update"):
+        await engine_client(raw_request).update_lora_weights(
+            WeightTransferUpdateRequest(update_info=update_info)
+        )
+    return JSONResponse(content={"message": "LoRA weights received"})
+
+
+@router.post("/finish_lora_weight_update")
+async def finish_lora_weight_update(
+    raw_request: Request,
+    update_id: Annotated[str | None, Body(embed=True)] = None,
+):
+    """Commit all workers, publish the model name, and remain paused."""
+    try:
+        with weight_operation_metrics().record("finish"):
+            update = await lora_models(raw_request).finish_lora_weight_update(update_id)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    return JSONResponse(
+        content={
+            "message": "LoRA weight update committed",
+            "lora_name": update.lora_name,
+            "version": update.version,
+            "update_id": update.update_id,
+        }
+    )
+
+
+@router.post("/abort_lora_weight_update")
+async def abort_lora_weight_update(
+    raw_request: Request,
+    update_id: Annotated[str | None, Body(embed=True)] = None,
+):
+    """Discard an uncommitted version without resuming generation."""
+    try:
+        await lora_models(raw_request).abort_lora_weight_update(update_id)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    return JSONResponse(content={"message": "LoRA weight update aborted"})
 
 
 @router.get("/weight_info")

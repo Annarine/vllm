@@ -1464,6 +1464,54 @@ class AsyncLLM(EngineClient):
         if weight_version is not None:
             await self.update_weight_version(weight_version)
 
+    async def start_lora_weight_update(self, request: dict[str, Any]) -> None:
+        """Drain generation and begin a LoRA update, leaving it paused."""
+        from vllm.lora.weight_update import LoRAWeightUpdateRequest
+
+        LoRAWeightUpdateRequest(**request)
+        config = self.vllm_config
+        if config.lora_config is None:
+            raise ValueError("IPC LoRA updates require enable_lora=True")
+        parallel = config.parallel_config
+        if parallel.data_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+            raise ValueError("IPC LoRA updates require DP=1 and PP=1")
+        if config.weight_transfer_config is None:
+            raise ValueError(
+                "Configured weight transfer backend does not support "
+                "LoRA weight updates"
+            )
+        capabilities = await self.collective_rpc("supports_lora_weight_updates")
+        if not capabilities or not all(capabilities):
+            raise ValueError(
+                "Configured weight transfer backend does not support "
+                "LoRA weight updates"
+            )
+        await self.pause_generation(mode="wait", clear_cache=True)
+        await self.collective_rpc(
+            "start_lora_weight_update", kwargs={"request": request}
+        )
+
+    async def update_lora_weights(self, request: WeightTransferUpdateRequest) -> None:
+        """Receive tensors for the active LoRA update."""
+        await self.collective_rpc(
+            "update_lora_weights", kwargs={"update_info": request.update_info}
+        )
+
+    async def finish_lora_weight_update(self, update_id: str | None = None) -> None:
+        """Prepare all workers before committing; leave generation paused."""
+        await self.collective_rpc(
+            "prepare_lora_weight_update", kwargs={"update_id": update_id}
+        )
+        await self.collective_rpc(
+            "commit_lora_weight_update", kwargs={"update_id": update_id}
+        )
+
+    async def abort_lora_weight_update(self, update_id: str | None = None) -> None:
+        """Discard an uncommitted update and leave generation paused."""
+        await self.collective_rpc(
+            "abort_lora_weight_update", kwargs={"update_id": update_id}
+        )
+
     async def update_weight_version(self, new_version: str) -> None:
         """Set the weight version without updating weights."""
         await self.engine_core.set_weight_version_async(new_version)

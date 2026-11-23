@@ -1,6 +1,6 @@
 # IPC Engine
 
-The IPC weight transfer engine uses **CUDA IPC** (Inter-Process Communication) handles to share GPU memory directly between the trainer and inference workers on the **same GPU**. This avoids any data copying, making it the most efficient option when colocating training and inference. Multi-GPU setups are supported — weights are all gathered by each GPU and are extracted by the correct colocated process.
+The IPC weight transfer engine uses **CUDA IPC** (Inter-Process Communication) handles to share GPU memory directly between the trainer and inference workers on the **same GPU**. This avoids staging weight data through CPU memory when colocating training and inference. Multi-GPU setups are supported — weights are all gathered by each GPU and are extracted by the correct colocated process.
 
 ## When to Use IPC
 
@@ -153,6 +153,198 @@ For different parameter subsets per worker, `update_info` may be a list indexed
 by worker rank. This form is IPC-only because collective backends require every
 worker to participate.
 
+## LoRA Weight Updates for RL
+
+`IPCTrainerWeightTransferEngine.send_lora_weights(request)` transfers a selected
+adapter's complete PEFT-format LoRA A/B tensors from a trainer to vLLM. It does
+not write an adapter checkpoint or update the base model. This is an opt-in
+path: enable LoRA and set `weight_transfer_config` to the IPC backend. Regular
+`send_weights()` continues to update base-model weights.
+
+Start with the runnable
+[`rlhf_lora_ipc.py`](../../../examples/rl/rlhf_lora_ipc.py) example. It creates
+a PEFT training model and a separate vLLM inference process on one GPU, sends
+an initial adapter, takes an optimizer step and sends the next revision. Both
+generations use the ordinary identity
+`LoRARequest("policy", 1, "ipc://policy")`; training tensors are never attached
+to generation requests.
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    python examples/rl/rlhf_lora_ipc.py
+```
+
+For HTTP, start a server on the same physical GPU as the trainer:
+
+```bash
+VLLM_SERVER_DEV_MODE=1 \
+VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 \
+VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
+CUDA_VISIBLE_DEVICES=0 \
+vllm serve Qwen/Qwen3-0.6B \
+    --enable-lora --max-loras 1 --max-cpu-loras 1 --max-lora-rank 8 \
+    --enforce-eager --gpu-memory-utilization 0.35 \
+    --weight-transfer-config '{"backend": "ipc"}'
+```
+
+Use `HTTPVLLMWeightSyncClient` with a `WeightSource` that exposes **only the
+selected adapter**, following `AdapterSource` in the example. Do not pass
+`ModuleSource(peft_model)`: it also exposes base-model parameters. Every source
+tensor must be a full PEFT A/B tensor; materialize any training-side shards
+before exporting it.
+
+### Request and Lifecycle
+
+The dictionary passed to `send_lora_weights()` contains:
+
+| Field | Meaning |
+| ----- | ------- |
+| `update_id` | Unique identifier for this transfer; each tensor payload carries the same ID |
+| `lora_name`, `lora_int_id` | Stable adapter name and positive integer ID |
+| `version` | Positive integer revision, increasing after each successful update |
+| `expected_version` | Previously committed revision, or `null` for the first IPC revision |
+| `peft_config` | JSON-serializable PEFT configuration, including `r`, `lora_alpha` and `target_modules` |
+| `names`, `dtype_names`, `shapes` | Ordered complete manifest; dtype names are `torch` attributes such as `"bfloat16"` |
+
+For a registered adapter, the PEFT configuration and ordered tensor schema must
+stay fixed across revisions. Each module needs both A and B; missing,
+duplicate, nonfinite, unknown or incompatible tensors are rejected. Supported
+wire dtypes are `float16`, `bfloat16` and `float32`.
+
+The trainer helper drives these control operations:
+
+| Python API | HTTP endpoint and body |
+| ---------- | ---------------------- |
+| `start_lora_weight_update(request)` | `POST /start_lora_weight_update` with `{"request": request}` |
+| `update_lora_weights(WeightTransferUpdateRequest(...))` | `POST /update_lora_weights` with `{"update_info": payload}` |
+| `finish_lora_weight_update(update_id)` | `POST /finish_lora_weight_update` with `{"update_id": update_id}` |
+| `abort_lora_weight_update(update_id)` | `POST /abort_lora_weight_update` with `{"update_id": update_id}` |
+
+The update payload uses the unpacked IPC fields documented above, plus
+`update_id`. HTTP uses `ipc_handles_pickled`; the existing insecure
+serialization opt-in applies. `HTTPVLLMWeightSyncClient` performs that encoding.
+Pass the same owner `update_id` when finishing or aborting: a stale command
+must not complete or cancel another trainer's active session. The optional
+no-argument forms remain available for compatibility; the trainer helper
+always passes its own ID.
+
+Online start drains in-flight requests with `pause_generation(mode="wait")`
+and clears the KV/prefix caches. It rejects new generation requests until an
+explicit `POST /resume` after successful finish. Offline updates require the
+previous `generate()` call to have finished and reset prefix caching before
+receiving. Do not update an adapter underneath a running request.
+
+Each worker copies received IPC tensors into its **own** GPU storage before
+constructing a candidate LoRA. All workers prepare before any worker commits;
+successful commit replaces and pins the adapter, then publishes its identity.
+Over HTTP, subsequent OpenAI-compatible requests can select `lora_name` as
+their `model`.
+
+The trainer helper validates the complete manifest on every trainer rank and
+requires those ranks to agree before contacting vLLM. It explicitly clones the
+selected A/B tensors into an immutable CUDA snapshot, then holds that snapshot
+until the transfer is acknowledged. Keep optimizer writes stopped while the
+helper captures the snapshot; the helper does not coordinate the optimizer or
+promise that concurrently modified tensors belong to one training step.
+
+When calling the raw APIs instead, the caller owns the export storage. Keep
+every exported tensor alive and unchanged until finish or abort has been
+acknowledged. `detach().contiguous()` does not necessarily create an
+independent snapshot. Receiver-owned copies are also necessary because LoRA
+normalization can scale B in place; IPC mappings must not become the inference
+adapter's long-term backing storage.
+
+If receive or prepare fails, abort the update to discard the candidate; the
+previous adapter remains installed. If installation fails after commit begins,
+the engine stays unavailable and must be restarted. An abort does not repair a
+partially committed update. Never resume generation unconditionally in an
+exception handler.
+
+After start has been acknowledged, `send_lora_weights()` attempts abort with
+its own `update_id` if a later operation fails. It does not abort after a
+failed start, which could otherwise cancel a different active session. If
+abort is not acknowledged, it retains the exported snapshots and rejects
+subsequent sends. A control-plane timeout does not prove that a worker has
+stopped opening or reading IPC handles, so those exports must not be freed or
+reused on that assumption.
+
+If workers reject a newly reserved start, the engine core aborts that owner
+before restoring its previous scheduling state. A failed abort acknowledgement
+keeps inference paused. A start rejected because another owner is already
+active leaves that owner's transaction intact.
+
+### Extending IPC for Device Plugins
+
+The LoRA control plane checks the instantiated transport's
+`supports_lora_weight_updates` property, rather than requiring the backend name
+`"ipc"`. `WeightTransferEngine` defaults to `False`; the IPC implementation
+enables it only for unpacked transfers. A registered device backend can reuse
+the LoRA update APIs under its own backend name when its workers expose this
+capability.
+
+The receiver contract is `receive_tensors(update_info)`, returning named
+tensors without loading them into the base model. Returned tensors may alias
+the producer's storage; the common LoRA session copies them into worker-owned
+storage before normalization. Implementing only `receive_weights()` does not
+implement this contract, because that method applies base-model weights.
+
+For an IPC subclass using the same unpacked payload, override these device
+hooks instead of copying the LoRA transfer lifecycle:
+
+| Class | Hook | Plugin responsibility |
+| ----- | ---- | --------------------- |
+| `IPCWeightTransferEngine` | `_get_device_uuid()` | Return the physical device identity used by the producer's handle map |
+| `IPCWeightTransferEngine` | `_rebuild_ipc_tensor(args)` | Reconstruct a tensor with the native device IPC API, remapping logical device indices as needed |
+| `IPCTrainerWeightTransferEngine` | `_initialize_device()` | Set `device`, `device_index` and `gpu_uuid`; the latter is an opaque wire identity despite its historical name |
+| `IPCTrainerWeightTransferEngine` | `_export_ipc_tensor(tensor)` | Return native reconstruction arguments for the tensor |
+| `IPCTrainerWeightTransferEngine` | `_synchronize_device()` | Complete device work before another process reads the export |
+| `IPCTrainerWeightTransferEngine` | `_post_send_sync()` | Keep trainer ranks aligned and perform native IPC cleanup after the receiver acknowledges the transfer |
+
+Call the parent trainer constructor so the shared state that retains
+unacknowledged LoRA exports is initialized. Import a device-specific reducer
+inside the export hook when its availability depends on plugin initialization;
+do not rely on a CUDA reducer imported before the device plugin registered its
+own reducer. A backend with a different wire format can override the complete
+`receive_tensors()` implementation instead of the receiver hooks.
+
+For example, an Ascend subclass would initialize `device` as an NPU device,
+use its physical chip identity for the handle map, export through the native
+`torch_npu` reducer and reconstruct through `rebuild_npu_tensor`. It would also
+replace the CUDA cleanup hook with NPU synchronization. These are extension
+requirements, not an included or hardware-validated `npu_ipc` implementation.
+
+Worker subclasses that override base-model updates, sleep, or adapter
+load/remove operations must preserve the common LoRA guards. The shared
+helpers are `_check_lora_update_idle()`, `_check_lora_adapter_load()` and
+`_check_lora_adapter_remove()`. Keep the installed-adapter restriction for sleep
+and base reloads, and the identity/version protection for adapter replacement.
+The public start/receive/prepare/commit/abort lifecycle, owned staging and cache
+invalidation remain shared. Device-specific LoRA layouts and tensor-parallel
+loading still require validation on the target hardware.
+
+### Initial Support
+
+- Unpacked IPC only (`packed=False`), CUDA, and an awake engine. Process
+  checkpoints are unsupported while an IPC adapter is installed.
+- One IPC LoRA adapter per engine, with fixed configuration, inference PP=1,
+  DP=1 and expert parallelism disabled. The adapter may target ordinary linear
+  layers in either a dense or an MoE base model, such as an attention output
+  projection. Each target must use a supported linear LoRA wrapper and provide
+  full A/B shapes; the inference LoRA loader performs TP slicing.
+- Each trainer GPU must provide the full adapter for its colocated inference
+  worker. Different physical GPUs, arbitrary pre-sharded LoRA tensors, routed
+  or shared expert LoRA, speculative decoding and updates while sleeping are
+  unsupported. Expert tensor paths are rejected in the manifest, and the
+  worker also rejects target layers outside the ordinary linear LoRA wrappers.
+- Use one API server process for HTTP so the published adapter identity has a
+  single owner. Reserve a LoRA slot for the pinned, memory-only adapter.
+- After its first commit, the IPC adapter stays pinned for the engine's
+  lifetime. Update it through these IPC APIs; disk-based replacement and
+  unloading of that adapter are rejected even between update rounds.
+- Base-model reloads and sleep are rejected while an IPC adapter is installed,
+  including after commit. Restart the engine to return to those workflows.
+- During an update, loading or removing any adapter is also rejected.
+
 ## Limitations
 
 - **Colocated only.** Each trainer rank shares memory with the inference worker
@@ -170,5 +362,6 @@ worker to participate.
 ## Examples
 
 - [RLHF with IPC weight syncing (`vllm serve`, HTTP)](../../../examples/rl/rlhf_http_ipc.py) - **Start here.** Server and training model share a single GPU; HTTP control plane, CUDA IPC data plane. Launches and tears down its own server
+- [RL LoRA weight updates through IPC](../../../examples/rl/rlhf_lora_ipc.py) - A PEFT optimizer step followed by direct A/B tensor transfer into an existing vLLM adapter
 - [IPC weight syncing from a trainer that does not import vLLM](../../../examples/rl/rlhf_http_ipc_no_vllm.py) - `torch` + `requests` only, `ipc_handles_pickled` over HTTP; see [Trainer Without vLLM over HTTP](#trainer-without-vllm-over-http)
 - [RLHF with IPC + FSDP2 and expert parallelism](../../../examples/rl/rlhf_ipc_fsdp_ep.py) - Multi-rank trainer colocated with a `--data-parallel-size 4` server on the same 4 GPUs: every FSDP rank builds an engine and joins the handle all-gather, with packed chunking and sleep/wake around the transfer

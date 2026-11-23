@@ -813,6 +813,10 @@ def _pausable_engine_core_proc() -> EngineCoreProc:
     core._checkpoint_state = CheckpointState.RUNNING
     core._checkpoint_error = None
     core._kv_cache_reclaimable = False
+    core._lora_weight_update_active = False
+    core._lora_weight_update_id = None
+    core._lora_weight_update_resume_on_finish = False
+    core._lora_weight_update_commit_failed = False
     core.model_executor = MagicMock()
     core.model_executor.vllm_config.cache_config.enable_extensible_kv_cache = False
     core.scheduler = MagicMock()
@@ -1048,3 +1052,277 @@ def test_pause_synchronizes_device_before_cache_reset(deferred: bool):
     else:
         assert result is None
     assert order == ["synchronize_device", "reset_caches"]
+
+
+def _linear_lora_update(hidden_size: int, output_size: int) -> dict:
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    return {
+        "update_id": "policy-1",
+        "lora_name": "policy",
+        "lora_int_id": 1,
+        "version": 1,
+        "expected_version": None,
+        "peft_config": {
+            "r": 8,
+            "lora_alpha": 8,
+            "target_modules": ["q_proj"],
+            "bias": "none",
+        },
+        "names": [f"{prefix}.lora_A.weight", f"{prefix}.lora_B.weight"],
+        "dtype_names": ["float32", "float32"],
+        "shapes": [[8, hidden_size], [output_size, 8]],
+    }
+
+
+def test_failed_lora_start_can_retry_after_committed_version(vllm_runner, monkeypatch):
+    """A stale start must not strand the installed policy or another owner."""
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    from vllm.config import WeightTransferConfig
+    from vllm.distributed.weight_transfer.base import (
+        WeightTransferInitRequest,
+        WeightTransferUpdateRequest,
+    )
+    from vllm.lora.request import LoRARequest
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    with vllm_runner(
+        MODEL_NAME,
+        enable_lora=True,
+        max_loras=1,
+        max_lora_rank=8,
+        max_model_len=64,
+        enforce_eager=True,
+        enable_trace_replay=True,
+        gpu_memory_utilization=0.2,
+        weight_transfer_config=WeightTransferConfig(backend="ipc"),
+    ) as runner:
+        llm = runner.get_llm()
+        llm.init_weight_transfer_engine(WeightTransferInitRequest({"packed": False}))
+        config = llm.llm_engine.model_config.hf_text_config
+        head_dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
+        request = _linear_lora_update(
+            config.hidden_size, head_dim * config.num_attention_heads
+        )
+        generator = torch.Generator(device="cpu").manual_seed(2026)
+        tensors = [
+            torch.randn(shape, generator=generator).to("cuda:0")
+            for shape in request["shapes"]
+        ]
+        physical_id = str(torch.cuda.get_device_properties(0).uuid)
+
+        def send_started_update(update):
+            handles = [{physical_id: reduce_tensor(tensor)[1]} for tensor in tensors]
+            torch.accelerator.synchronize()
+            llm.update_lora_weights(
+                WeightTransferUpdateRequest(
+                    {
+                        "update_id": update["update_id"],
+                        "names": update["names"],
+                        "dtype_names": update["dtype_names"],
+                        "shapes": update["shapes"],
+                        "ipc_handles": handles,
+                    }
+                )
+            )
+            llm.finish_lora_weight_update(update["update_id"])
+
+        llm.start_lora_weight_update(request)
+        send_started_update(request)
+        assert set(llm.llm_engine.list_loras()) == {1}
+
+        # None is valid manifest metadata, but stale once revision 1 exists.
+        stale = {**request, "update_id": "stale-start", "version": 2}
+        with pytest.raises(Exception, match="expected LoRA version"):
+            llm.start_lora_weight_update(stale)
+        assert not llm.llm_engine.engine_core.is_sleeping()
+        llm.collective_rpc(
+            "abort_lora_weight_update", kwargs={"update_id": stale["update_id"]}
+        )
+        assert not llm.llm_engine.engine_core.is_sleeping()
+
+        second = {
+            **request,
+            "update_id": "policy-2",
+            "version": 2,
+            "expected_version": 1,
+        }
+        llm.start_lora_weight_update(second)
+        # Exercise the core guard, rather than the frontend's pending guard.
+        with pytest.raises(Exception, match="already active"):
+            llm.collective_rpc("start_lora_weight_update", kwargs={"request": stale})
+        with pytest.raises(Exception, match="update_id"):
+            llm.collective_rpc(
+                "abort_lora_weight_update", kwargs={"update_id": stale["update_id"]}
+            )
+        send_started_update(second)
+        assert not llm.llm_engine.engine_core.is_sleeping()
+        output = llm.generate(
+            {"prompt_token_ids": [1, 2, 3]},
+            SamplingParams(temperature=0, max_tokens=1, trace_decode_token_ids=[42]),
+            lora_request=LoRARequest("policy", 1, "ipc://policy"),
+        )[0]
+        assert list(output.outputs[0].token_ids) == [42]
+
+
+class _FailedStartExecutor(UniProcExecutor):
+    """Inject lost RPC acknowledgements at the real worker service boundary."""
+
+    def __init__(self, *args, **kwargs):
+        self.fail_start = True
+        self.fail_abort = True
+        self.fail_commit = False
+        self.abort_ids: list[str] = []
+        super().__init__(*args, **kwargs)
+
+    def collective_rpc(
+        self,
+        method,
+        timeout=None,
+        args=(),
+        kwargs=None,
+        non_block=False,
+        single_value=False,
+        **options,
+    ):
+        if method == "abort_lora_weight_update":
+            self.abort_ids.append(kwargs["update_id"])
+            if self.fail_abort:
+                raise TimeoutError("Abort acknowledgement was lost")
+        result = super().collective_rpc(
+            method, timeout, args, kwargs, non_block, single_value, **options
+        )
+        if method == "start_lora_weight_update" and self.fail_start:
+            self.fail_start = False
+            raise ConnectionError("Start acknowledgement was lost")
+        if method == "commit_lora_weight_update" and self.fail_commit:
+            raise ConnectionError("Commit acknowledgement was lost")
+        return result
+
+
+@create_new_process_for_each_test()
+@pytest.mark.parametrize("already_paused", [False, True])
+def test_failed_lora_start_stays_paused_until_abort_acknowledged(already_paused):
+    """Recover a rejected start only after ACK; an uncertain commit stays fatal."""
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    from vllm.config import WeightTransferConfig
+
+    engine_args = EngineArgs(
+        model=MODEL_NAME,
+        enable_lora=True,
+        max_lora_rank=8,
+        max_model_len=64,
+        enforce_eager=True,
+        gpu_memory_utilization=0.2,
+        weight_transfer_config=WeightTransferConfig(backend="ipc"),
+    )
+    config = engine_args.create_engine_config()
+    core = EngineCore(
+        vllm_config=config, executor_class=_FailedStartExecutor, log_stats=False
+    )
+    try:
+        text_config = config.model_config.hf_text_config
+        head_dim = getattr(text_config, "head_dim", None) or (
+            text_config.hidden_size // text_config.num_attention_heads
+        )
+        request = _linear_lora_update(
+            text_config.hidden_size, head_dim * text_config.num_attention_heads
+        )
+        executor = core.model_executor
+        # Frontend validation can reject a start before the core owns its ID.
+        # Cleanup still requires a real worker acknowledgement, not a tombstone.
+        executor.fail_abort = False
+        core.collective_rpc(
+            "abort_lora_weight_update", kwargs={"update_id": "preflight-rejected"}
+        )
+        assert core.is_inference_ready()
+        initial_aborts = list(executor.abort_ids)
+        executor.fail_abort = True
+        if already_paused:
+            core.pause_scheduler(mode="keep", clear_cache=False)
+        with pytest.raises(ConnectionError, match="Start acknowledgement"):
+            core.collective_rpc("start_lora_weight_update", kwargs={"request": request})
+        assert core.is_sleeping()
+        assert not core.is_inference_ready()
+        assert executor.abort_ids == initial_aborts + [request["update_id"]]
+
+        foreign = {**request, "update_id": "foreign-start"}
+        with pytest.raises(RuntimeError, match="already active"):
+            core.collective_rpc("start_lora_weight_update", kwargs={"request": foreign})
+        with pytest.raises(ValueError, match="update_id"):
+            core.collective_rpc(
+                "abort_lora_weight_update", kwargs={"update_id": foreign["update_id"]}
+            )
+        assert executor.abort_ids == initial_aborts + [request["update_id"]]
+
+        executor.fail_abort = False
+        core.collective_rpc(
+            "abort_lora_weight_update", kwargs={"update_id": request["update_id"]}
+        )
+        assert core.is_sleeping() == already_paused
+        if already_paused:
+            core.resume_scheduler()
+        assert core.is_inference_ready()
+        acknowledged_aborts = list(executor.abort_ids)
+        core.collective_rpc(
+            "abort_lora_weight_update", kwargs={"update_id": request["update_id"]}
+        )
+        assert core.is_inference_ready()
+        assert executor.abort_ids == acknowledged_aborts + [request["update_id"]]
+        core.collective_rpc("start_lora_weight_update", kwargs={"request": foreign})
+        with pytest.raises(ValueError, match="update_id"):
+            core.collective_rpc(
+                "abort_lora_weight_update", kwargs={"update_id": request["update_id"]}
+            )
+        core.collective_rpc(
+            "abort_lora_weight_update", kwargs={"update_id": foreign["update_id"]}
+        )
+        assert core.is_inference_ready()
+
+        uncertain = {**request, "update_id": "uncertain-commit"}
+        core.collective_rpc("start_lora_weight_update", kwargs={"request": uncertain})
+        tensors = [torch.ones(shape, device="cuda:0") for shape in request["shapes"]]
+        physical_id = str(torch.cuda.get_device_properties(0).uuid)
+        handles = [{physical_id: reduce_tensor(tensor)[1]} for tensor in tensors]
+        torch.accelerator.synchronize()
+        core.collective_rpc(
+            "update_lora_weights",
+            kwargs={
+                "update_info": {
+                    "update_id": uncertain["update_id"],
+                    "names": request["names"],
+                    "dtype_names": request["dtype_names"],
+                    "shapes": request["shapes"],
+                    "ipc_handles": handles,
+                }
+            },
+        )
+        core.collective_rpc(
+            "prepare_lora_weight_update", kwargs={"update_id": uncertain["update_id"]}
+        )
+        executor.fail_commit = True
+        with pytest.raises(ConnectionError, match="Commit acknowledgement"):
+            core.collective_rpc(
+                "commit_lora_weight_update",
+                kwargs={"update_id": uncertain["update_id"]},
+            )
+        # The real worker committed successfully: its local failure flag cannot
+        # protect the engine when the coordinator lost the commit response.
+        assert executor.collective_rpc("has_incomplete_weight_update") == [False]
+        assert executor.collective_rpc("list_loras") == [{1}]
+        with pytest.raises(RuntimeError, match="restart"):
+            core.collective_rpc(
+                "abort_lora_weight_update", kwargs={"update_id": uncertain["update_id"]}
+            )
+        with pytest.raises(RuntimeError, match="restart"):
+            core.collective_rpc("start_lora_weight_update", kwargs={"request": foreign})
+        with pytest.raises(RuntimeError, match="restart"):
+            core.resume_scheduler()
+        assert core.is_sleeping()
+        assert not core.is_inference_ready()
+    finally:
+        core.shutdown()

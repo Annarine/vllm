@@ -25,6 +25,7 @@ steps:
       --ignore=lora/test_gptoss_tp.py
       --ignore=lora/test_qwen3moe_tp.py
       --ignore=lora/test_qwen35_densemodel_lora.py
+      --deselect=lora/test_lora_functions.py::test_ipc_lora_update_preserves_source_and_invalidates_prefix_cache
   mirror:
     amd:
       label: ":amd: (MI355 DPX) LoRA"
@@ -39,6 +40,27 @@ steps:
       - vllm/platforms/rocm.py
       depends_on:
       - image-build-amd
+
+
+- label: ":nvidia: (H200 MIG 35GB) LoRA IPC weight updates"
+  device: h200_35gb
+  key: lora-ipc-weight-updates
+  timeout_in_minutes: 20
+  source_file_dependencies:
+  - vllm/lora
+  - vllm/distributed/weight_transfer
+  - vllm/entrypoints/rl
+  - vllm/entrypoints/openai/models
+  - vllm/engine/protocol.py
+  - vllm/v1/engine
+  - vllm/v1/worker
+  - tests/lora
+  commands:
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - >-
+      pytest -v -s
+      lora/test_lora_functions.py
+      -k ipc_lora_update
 
 
 - label: ":nvidia: (L4) [Nightly] LoRA TP (Distributed)"

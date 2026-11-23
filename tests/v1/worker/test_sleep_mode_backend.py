@@ -8,7 +8,9 @@ in `tests/basic_correctness/memory/`.
 """
 
 import pytest
+from transformers import LlamaConfig
 
+from vllm.config import ModelConfig, VllmConfig
 from vllm.device_allocator.sleep_mode_backend import (
     CuMemBackend,
     SleepModeBackend,
@@ -39,10 +41,10 @@ def test_new_backend_starts_in_running_state():
 
 
 @pytest.mark.parametrize("enable_nccl_comm_suspend", [True, False])
-def test_worker_drives_communicator_suspension(monkeypatch, enable_nccl_comm_suspend):
+def test_worker_drives_communicator_suspension(
+    monkeypatch, tmp_path, enable_nccl_comm_suspend
+):
     """Comm walkers run around sleep/wake only when explicitly enabled."""
-    from types import SimpleNamespace
-
     from vllm.v1.worker.gpu_worker import Worker
 
     calls: list[tuple[str, object]] = []
@@ -54,12 +56,29 @@ def test_worker_drives_communicator_suspension(monkeypatch, enable_nccl_comm_sus
         def resume(self, tags: list[str] | None = None) -> None:
             calls.append(("backend.resume", tuple(tags) if tags else None))
 
-    worker = object.__new__(Worker)
-    worker._sleep_mode_backend = Backend()
-    worker.model_runner = SimpleNamespace(extensible_kv_cache=None)
-    worker.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(enable_nccl_comm_suspend=enable_nccl_comm_suspend)
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+        max_position_embeddings=32,
+    ).save_pretrained(tmp_path)
+    worker = Worker(
+        vllm_config=VllmConfig(
+            model_config=ModelConfig(
+                model=str(tmp_path),
+                skip_tokenizer_init=True,
+                enable_nccl_comm_suspend=enable_nccl_comm_suspend,
+            )
+        ),
+        local_rank=0,
+        rank=0,
+        distributed_init_method="env://",
     )
+    worker._sleep_mode_backend = Backend()
 
     monkeypatch.setattr("torch.accelerator.synchronize", lambda: None)
     monkeypatch.setattr("torch.accelerator.get_memory_info", lambda: (0, 0))

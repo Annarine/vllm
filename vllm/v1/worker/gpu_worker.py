@@ -66,6 +66,7 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.lora.weight_update import LoRAWeightUpdateRequest, LoRAWeightUpdateSession
 from vllm.model_executor.layers.quantization.online.lm_head import (
     restore_quantized_lm_heads,
     share_source_lm_heads,
@@ -259,6 +260,9 @@ class Worker(WorkerBase):
         # Update targets (is_draft) whose weights may be incomplete.
         self._incomplete_weight_updates: set[bool] = set()
         self._weight_update_is_draft = False
+        self._lora_update_session: LoRAWeightUpdateSession | None = None
+        self._lora_update_failed = False
+        self._lora_update_versions: dict[int, LoRAWeightUpdateRequest] = {}
         # Set by the engine while a pause has emptied the KV cache.
         self._kv_cache_reclaimable = False
         # Keeps the KV cache lent to the active weight update until it ends.
@@ -327,6 +331,7 @@ class Worker(WorkerBase):
         return set(storage.values()) - preserved
 
     def sleep(self, level: int = 1) -> None:
+        self._check_lora_update_idle("sleep", allow_registered=False)
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
         # Level 2 keeps everything the weight update doesn't rewrite.
@@ -388,6 +393,7 @@ class Worker(WorkerBase):
         self.sleep_mode_backend.discard(tags)
 
     def checkpoint_prepare(self) -> None:
+        self._check_lora_update_idle("prepare a checkpoint", allow_registered=False)
         checkpoint_prepare_distributed_state()
 
     def checkpoint_restore(self) -> None:
@@ -1617,10 +1623,47 @@ class Worker(WorkerBase):
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
+        self._check_lora_adapter_load(lora_request)
         return self.model_runner.add_lora(lora_request)
 
+    def _check_lora_update_idle(
+        self, operation: str, *, allow_registered: bool = True
+    ) -> None:
+        """Guard device-specific overrides that change weights or residency.
+
+        Platform workers overriding sleep, transfer initialization, or model
+        reload must call this before changing device state. Sleep and base-model
+        reload pass `allow_registered=False` for memory-only adapters.
+        """
+        if self._lora_update_session is not None or self._lora_update_failed:
+            raise RuntimeError(f"Cannot {operation} during an incomplete LoRA update")
+        if not allow_registered and self._lora_update_versions:
+            raise RuntimeError(f"Cannot {operation} with memory-only LoRA adapters")
+
+    def _check_lora_adapter_load(self, lora_request: LoRARequest) -> None:
+        """Protect in-memory adapter identity in platform `add_lora` overrides."""
+        self._check_lora_update_idle("load an adapter")
+        previous = self._lora_update_versions.get(lora_request.lora_int_id)
+        if previous is not None and (
+            lora_request.load_inplace
+            or lora_request.lora_name != previous.lora_name
+            or lora_request.lora_path != previous.to_lora_request().lora_path
+        ):
+            raise ValueError(
+                "Use the LoRA update APIs to replace a memory-only adapter"
+            )
+
     def remove_lora(self, lora_id: int) -> bool:
+        self._check_lora_adapter_remove(lora_id)
         return self.model_runner.remove_lora(lora_id)
+
+    def _check_lora_adapter_remove(self, lora_id: int) -> None:
+        """Protect pinned adapters in platform `remove_lora` overrides."""
+        self._check_lora_update_idle("unload an adapter")
+        if lora_id in self._lora_update_versions:
+            raise RuntimeError(
+                "Memory-only LoRA adapters remain pinned for the engine lifetime"
+            )
 
     def list_loras(self) -> set[int]:
         return self.model_runner.list_loras()
@@ -1670,6 +1713,9 @@ class Worker(WorkerBase):
 
         """
         self._check_weight_transfer_engine()
+        self._check_lora_update_idle("initialize a transfer engine")
+        if self._weight_update_active:
+            raise RuntimeError("Cannot initialize a transfer engine during an update")
         assert self.weight_transfer_engine is not None
         # Parse dict into backend-specific typed dataclass
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
@@ -1677,6 +1723,7 @@ class Worker(WorkerBase):
 
     def shutdown_weight_transfer_engine(self) -> None:
         """Release a trainer connection without shutting down inference."""
+        self._check_lora_update_idle("release a trainer connection")
         if self._weight_update_active:
             raise RuntimeError(
                 "Cannot release a trainer connection during a weight update"
@@ -1685,7 +1732,151 @@ class Worker(WorkerBase):
             self.weight_transfer_engine.shutdown()
 
     def has_incomplete_weight_update(self) -> bool:
-        return bool(self._incomplete_weight_updates)
+        return bool(
+            self._incomplete_weight_updates
+            or self._lora_update_session is not None
+            or self._lora_update_failed
+        )
+
+    def supports_lora_weight_updates(self) -> bool:
+        engine = self.weight_transfer_engine
+        return engine is not None and engine.supports_lora_weight_updates
+
+    def start_lora_weight_update(self, request: dict) -> None:
+        """Stage ordinary linear adapter tensors without reloading the base model."""
+        if self._weight_update_active or self._lora_update_session is not None:
+            raise RuntimeError("A weight update is already active")
+        if self._lora_update_failed:
+            raise RuntimeError("A LoRA commit failed; restart the inference engine")
+        if self._incomplete_weight_updates:
+            raise RuntimeError("The base model has an incomplete weight update")
+        engine = self.weight_transfer_engine
+        if engine is None or not engine.supports_lora_weight_updates:
+            raise ValueError(
+                "Configured weight transfer backend does not support "
+                "LoRA weight updates"
+            )
+        config = self.vllm_config
+        if (
+            config.lora_config is None
+            or config.parallel_config.pipeline_parallel_size != 1
+            or config.parallel_config.data_parallel_size != 1
+            or config.parallel_config.enable_expert_parallel
+            or config.speculative_config is not None
+        ):
+            raise ValueError(
+                "LoRA weight updates require LoRA, DP=PP=1, expert parallelism "
+                "disabled, and no speculative decoding"
+            )
+        spec = LoRAWeightUpdateRequest(**request)
+        if (
+            self._lora_update_versions
+            and spec.lora_int_id not in self._lora_update_versions
+        ):
+            raise ValueError(
+                "Only one memory-only LoRA adapter is supported per engine"
+            )
+        previous = self._lora_update_versions.get(spec.lora_int_id)
+        if spec.expected_version != (previous.version if previous else None):
+            raise ValueError(
+                "The expected LoRA version does not match the current version"
+            )
+        if previous is not None and (
+            spec.lora_name != previous.lora_name
+            or spec.schema_key != previous.schema_key
+        ):
+            raise ValueError(
+                "The LoRA identity, configuration and manifest must stay fixed"
+            )
+        with set_current_vllm_config(config):
+            self._lora_update_session = LoRAWeightUpdateSession(
+                self.model_runner.lora_manager, spec, self.device
+            )
+
+    def update_lora_weights(self, update_info: dict | list[dict]) -> None:
+        """Copy a chunk into the active adapter's owned staging storage."""
+        session = self._lora_update_session
+        if session is None:
+            raise RuntimeError("start_lora_weight_update must be called first")
+        if isinstance(update_info, list):
+            update_info = update_info[self.rank]
+        local_info = dict(update_info)
+        if local_info.pop("update_id", None) != session.request.update_id:
+            raise ValueError("Chunk update_id does not match the LoRA session")
+        engine = self.weight_transfer_engine
+        if engine is None or not engine.supports_lora_weight_updates:
+            raise ValueError("The transfer engine does not support LoRA weight updates")
+        names = local_info.get("names")
+        dtype_names = local_info.get("dtype_names")
+        shapes = local_info.get("shapes")
+        if (
+            not isinstance(names, list)
+            or not isinstance(dtype_names, list)
+            or not isinstance(shapes, list)
+            or len(names) != len(dtype_names)
+            or len(names) != len(shapes)
+        ):
+            raise ValueError(
+                "LoRA chunks require aligned names, dtype_names and shapes"
+            )
+        manifest = dict(
+            zip(
+                session.request.names,
+                zip(session.request.dtype_names, session.request.shapes),
+            )
+        )
+        for name, dtype_name, shape in zip(names, dtype_names, shapes):
+            if not isinstance(name, str) or manifest.get(name) != (dtype_name, shape):
+                raise ValueError(
+                    f"Metadata for {name!r} differs from the LoRA manifest"
+                )
+        with set_current_vllm_config(self.vllm_config):
+            typed_info = engine.parse_update_info(local_info)
+            session.consume(engine.receive_tensors(typed_info))
+            torch.accelerator.synchronize()
+
+    def _check_lora_update_id(self, update_id: str | None) -> None:
+        if update_id is not None and (
+            self._lora_update_session is None
+            or update_id != self._lora_update_session.request.update_id
+        ):
+            raise ValueError("update_id does not match the active LoRA session")
+
+    def prepare_lora_weight_update(self, update_id: str | None = None) -> None:
+        self._check_lora_update_id(update_id)
+        if self._lora_update_failed:
+            raise RuntimeError("A LoRA commit failed; restart the inference engine")
+        if self._lora_update_session is None:
+            raise RuntimeError("No LoRA update is active")
+        with set_current_vllm_config(self.vllm_config):
+            self._lora_update_session.prepare()
+            torch.accelerator.synchronize()
+
+    def commit_lora_weight_update(self, update_id: str | None = None) -> None:
+        self._check_lora_update_id(update_id)
+        if self._lora_update_failed:
+            raise RuntimeError("A LoRA commit failed; restart the inference engine")
+        session = self._lora_update_session
+        if session is None:
+            raise RuntimeError("No LoRA update is active")
+        # Installation can modify adapter slots. A failure after this point is
+        # fatal until the engine is restarted, even if the session is aborted.
+        self._lora_update_failed = True
+        with set_current_vllm_config(self.vllm_config):
+            session.commit()
+            torch.accelerator.synchronize()
+        self._lora_update_versions[session.request.lora_int_id] = session.request
+        self._lora_update_session = None
+        self._lora_update_failed = False
+
+    def abort_lora_weight_update(self, update_id: str | None = None) -> None:
+        # Some workers may have rejected start before creating a session. The
+        # engine core checks the owner ID before aborting across all workers.
+        if self._lora_update_session is None:
+            return
+        self._check_lora_update_id(update_id)
+        self._lora_update_session.abort()
+        self._lora_update_session = None
 
     def start_weight_update(self) -> None:
         """Start a new weight update session.
@@ -1706,6 +1897,9 @@ class Worker(WorkerBase):
 
     def _start_weight_update(self, is_draft: bool = False) -> None:
         self._check_weight_transfer_engine()
+        self._check_lora_update_idle(
+            "reload base model weights", allow_registered=False
+        )
         assert self.weight_transfer_engine is not None
 
         if is_draft and not self.weight_transfer_engine.supports_draft_weight_update:

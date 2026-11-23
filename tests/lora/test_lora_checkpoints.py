@@ -6,6 +6,7 @@ import pytest
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import parse_fine_tuned_lora_name
+from vllm.lora.weight_update import LoRAWeightUpdateRequest
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -154,3 +155,86 @@ def test_gemma4_moe_lora_weights_mapping():
         "model.layers.9.experts.gate_up_proj",
         False,
     )
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"names": []}, "nonempty and unique"),
+        (
+            {"names": ["x.lora_A.weight", "x.lora_A.weight"]},
+            "nonempty and unique",
+        ),
+        (
+            {
+                "names": [
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+                ],
+                "dtype_names": ["float32"],
+                "shapes": [[2, 4]],
+            },
+            "Missing LoRA A/B pair",
+        ),
+        ({"shapes": [[3, 4], [4, 2]]}, "does not match rank"),
+        ({"dtype_names": ["int64", "int64"]}, "Unsupported LoRA tensor dtype"),
+        ({"version": 2, "expected_version": 2}, "newer than expected_version"),
+        (
+            {
+                "peft_config": {
+                    "r": 2,
+                    "lora_alpha": 4,
+                    "target_modules": ["q_proj"],
+                    "use_dora": True,
+                }
+            },
+            "does not yet support DoRA",
+        ),
+    ],
+)
+def test_lora_weight_update_rejects_invalid_manifest(overrides, message):
+    """Reject incomplete or incompatible revisions before importing IPC storage."""
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    fields = {
+        "update_id": "policy-1",
+        "lora_name": "policy",
+        "lora_int_id": 1,
+        "version": 1,
+        "expected_version": None,
+        "peft_config": {"r": 2, "lora_alpha": 4, "target_modules": ["q_proj"]},
+        "names": [f"{prefix}.lora_A.weight", f"{prefix}.lora_B.weight"],
+        "dtype_names": ["float32", "float32"],
+        "shapes": [[2, 4], [4, 2]],
+    }
+    with pytest.raises(ValueError, match=message):
+        LoRAWeightUpdateRequest(**(fields | overrides))
+
+
+@pytest.mark.parametrize(
+    "expert_path", ["experts.0", "routed_experts.0", "shared_expert", "shared_experts"]
+)
+def test_lora_weight_update_rejects_experts_before_loader_filtering(expert_path):
+    """Reject mixed revisions before an expert loader could drop their tensors."""
+    prefix = "base_model.model.model.layers.0"
+    modules = [f"{prefix}.linear_attn.o_proj", f"{prefix}.mlp.{expert_path}.down_proj"]
+    with pytest.raises(
+        ValueError, match="Expert LoRA weight updates are not supported"
+    ):
+        LoRAWeightUpdateRequest(
+            update_id="policy-1",
+            lora_name="policy",
+            lora_int_id=1,
+            version=1,
+            expected_version=None,
+            peft_config={
+                "r": 2,
+                "lora_alpha": 4,
+                "target_modules": ["o_proj", "down_proj"],
+            },
+            names=[
+                f"{module}.lora_{side}.weight"
+                for module in modules
+                for side in ("A", "B")
+            ],
+            dtype_names=["bfloat16"] * 4,
+            shapes=[[2, 4], [4, 2]] * 2,
+        )

@@ -179,6 +179,10 @@ class WorkerBase:
         """Whether this worker can update its configured speculative model."""
         return False
 
+    def supports_lora_weight_updates(self) -> bool:
+        """Whether the configured backend can receive adapter tensors separately."""
+        return False
+
     def has_incomplete_weight_update(self) -> bool:
         """Whether a weight update started and has not finished successfully,
         so the model weights may be incomplete."""

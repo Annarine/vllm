@@ -13,7 +13,7 @@ import pickle
 import runpy
 import threading
 import time
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 from functools import cached_property
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -24,6 +24,7 @@ import ray
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
 
+from vllm.config import DeviceConfig, VllmConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer import (
@@ -2415,6 +2416,153 @@ class _ScriptedSource(WeightSource):
         yield from self._pairs
 
 
+class _CPUIPCTrainer(IPCTrainerWeightTransferEngine):
+    """Exercise the IPC extension contract on a real, non-CUDA device."""
+
+    def _initialize_device(self) -> None:
+        self.device = torch.device("cpu")
+        self.device_index = 0
+        self.gpu_uuid = "cpu-ipc-device"
+        self.exported_pointers: list[int] = []
+        self.synchronizations = 0
+
+    def _export_ipc_tensor(self, tensor: torch.Tensor) -> tuple:
+        self.exported_pointers.append(tensor.data_ptr())
+        return (tensor,)
+
+    def _synchronize_device(self) -> None:
+        self.synchronizations += 1
+
+    def _post_send_sync(self) -> None:
+        self._synchronize_device()
+
+
+class _CPUIPCReceiver(IPCWeightTransferEngine):
+    def _get_device_uuid(self) -> str:
+        return "cpu-ipc-device"
+
+    def _rebuild_ipc_tensor(self, args: tuple) -> torch.Tensor:
+        (tensor,) = args
+        return tensor.view_as(tensor)
+
+
+class _RecordingLoRAClient(RecordingClient):
+    """Record the external server contract, including its session owner."""
+
+    def start_lora_weight_update(self, request: dict) -> None:
+        self.order.append("lora_start")
+        self.update_id = request["update_id"]
+
+    def update_lora_weights(self, update_info: dict) -> None:
+        self.order.append("lora_update")
+        self.last_update_info = update_info
+
+    def finish_lora_weight_update(self, update_id: str | None = None) -> None:
+        assert update_id == self.update_id
+        self.order.append("lora_finish")
+
+    def abort_lora_weight_update(self, update_id: str | None = None) -> None:
+        assert update_id == self.update_id
+        self.order.append("lora_abort")
+
+
+@pytest.mark.parametrize("lora", [False, True])
+def test_ipc_trainer_device_hooks_support_non_cuda_transfers(lora):
+    """Inherited sends use plugin exports and freeze LoRA source tensors."""
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    pairs = [
+        (f"{prefix}.lora_A.weight", torch.arange(8.0, device="cpu").reshape(2, 4)),
+        (f"{prefix}.lora_B.weight", torch.arange(8.0, device="cpu").reshape(4, 2)),
+    ]
+    metadata = [ParamMeta(name, tensor.dtype, tensor.shape) for name, tensor in pairs]
+    client = _RecordingLoRAClient()
+    engine = _CPUIPCTrainer.trainer_init(
+        IPCTrainerInitInfo(rank=0),
+        client=client,
+        source=_ScriptedSource(metadata, pairs),
+    )
+    if lora:
+        engine.send_lora_weights(
+            {
+                "update_id": "cpu-policy-1",
+                "lora_name": "policy",
+                "lora_int_id": 1,
+                "version": 1,
+                "expected_version": None,
+                "peft_config": {
+                    "r": 2,
+                    "lora_alpha": 4,
+                    "target_modules": ["q_proj"],
+                },
+                "names": [meta.name for meta in metadata],
+                "dtype_names": ["float32", "float32"],
+                "shapes": [[2, 4], [4, 2]],
+            }
+        )
+        assert client.order == ["init", "lora_start", "lora_update", "lora_finish"]
+        assert all(
+            pointer != tensor.data_ptr()
+            for pointer, (_, tensor) in zip(engine.exported_pointers, pairs)
+        )
+    else:
+        engine.send_weights()
+        assert client.order == ["init", "start", "update", "finish"]
+    assert client.last_init_info == {"packed": False}
+    assert engine.device == torch.device("cpu")
+    assert len(engine.exported_pointers) == len(pairs)
+    assert engine.synchronizations >= 1
+    assert client.last_update_info is not None
+    assert client.last_update_info["names"] == [meta.name for meta in metadata]
+    for (_, original), handle in zip(pairs, client.last_update_info["ipc_handles"]):
+        (exported,) = handle["cpu-ipc-device"]
+        torch.testing.assert_close(exported, original, rtol=0, atol=0)
+
+
+def test_ipc_receive_tensors_uses_device_hooks_without_loading_the_model():
+    """A plugin can import adapter tensors without modifying base weights."""
+    model = torch.nn.Linear(4, 2, bias=False, device="cpu")
+    original = model.weight.detach().clone()
+    config = WeightTransferConfig(backend="plugin_ipc")
+    vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"), weight_transfer_config=config
+    )
+    engine = _CPUIPCReceiver(config, vllm_config, torch.device("cpu"), model)
+    tensor = torch.arange(8.0, device="cpu").reshape(2, 4)
+    info = IPCWeightTransferUpdateInfo(
+        names=["adapter.lora_A.weight"],
+        dtype_names=["float32"],
+        shapes=[[2, 4]],
+        ipc_handles=[
+            {
+                "cpu-ipc-device": (tensor,),
+                "unrelated-device": (torch.zeros_like(tensor),),
+            }
+        ],
+    )
+    assert engine.supports_lora_weight_updates
+    [(name, received)] = engine.receive_tensors(info)
+    assert name == "adapter.lora_A.weight"
+    torch.testing.assert_close(received, tensor, rtol=0, atol=0)
+    assert received.data_ptr() == tensor.data_ptr()
+    torch.testing.assert_close(model.weight, original, rtol=0, atol=0)
+    engine.init_transfer_engine(IPCWeightTransferInitInfo(packed=True))
+    assert not engine.supports_lora_weight_updates
+
+
+def test_weight_transport_requires_explicit_lora_tensor_capability():
+    """An existing backend remains usable without opting into LoRA receives."""
+    config = WeightTransferConfig(backend="nccl")
+    vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"), weight_transfer_config=config
+    )
+    engine = NCCLWeightTransferEngine(
+        config, vllm_config, torch.device("cpu"), torch.nn.Linear(2, 2, device="cpu")
+    )
+    assert not engine.supports_lora_weight_updates
+    with pytest.raises(NotImplementedError, match="does not support receiving LoRA"):
+        engine.receive_tensors(NCCLWeightTransferUpdateInfo())
+
+
 def _mock_group_engine(source, monkeypatch, **kwargs):
     """Unpacked trainer engine with a mocked group and stream (no GPU needed)."""
     engine = NCCLTrainerWeightTransferEngine(
@@ -2882,19 +3030,30 @@ def _make_modelexpress_engine():
 
 
 @pytest.fixture
-def mx_worker(mx_client, monkeypatch):
+def mx_worker(mx_client):
     from vllm.v1.worker import gpu_worker
 
-    monkeypatch.setattr(gpu_worker, "set_current_vllm_config", lambda _: nullcontext())
-    worker = object.__new__(gpu_worker.Worker)
+    class RefitRunner(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+            self.extensible_kv_cache = None
+
+        def get_model(self):
+            return self.model
+
+        def on_target_weights_replaced(self):
+            pass
+
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    worker = gpu_worker.Worker(
+        vllm_config=config,
+        local_rank=0,
+        rank=0,
+        distributed_init_method="tcp://127.0.0.1:29500",
+    )
     worker.weight_transfer_engine = _make_modelexpress_engine()
-    worker.vllm_config = worker.weight_transfer_engine.vllm_config
-    worker._weight_update_active = False
-    worker._incomplete_weight_updates = set()
-    worker._weight_update_is_draft = False
-    worker._kv_cache_reclaimable = False
-    worker._weight_update_kv_cache_loan = ExitStack()
-    worker.model_runner = MagicMock(extensible_kv_cache=None)
+    worker.model_runner = RefitRunner(worker.weight_transfer_engine.model)
     return worker
 
 

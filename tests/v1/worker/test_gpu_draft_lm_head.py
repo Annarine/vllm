@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
-from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
@@ -111,18 +110,18 @@ def test_refresh_follows_target_update(
 
 
 def _draft_update_worker(vllm_config, drafter: torch.nn.Module, **engine) -> Worker:
-    worker = object.__new__(Worker)
-    worker.vllm_config = vllm_config
+    worker = Worker(
+        vllm_config=vllm_config,
+        local_rank=0,
+        rank=0,
+        distributed_init_method="env://",
+    )
     worker.weight_transfer_engine = SimpleNamespace(
         supports_draft_weight_update=True,
         reset_weight_update_target=lambda: None,
         **engine,
     )
     worker.model_runner = SimpleNamespace(get_draft_model=lambda: drafter)
-    worker._weight_update_active = False
-    worker._incomplete_weight_updates = set()
-    worker._kv_cache_reclaimable = False
-    worker._weight_update_kv_cache_loan = ExitStack()
     worker._set_draft_weight_update_target = lambda: None  # type: ignore[method-assign]
     return worker
 

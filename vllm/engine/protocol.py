@@ -345,6 +345,22 @@ class EngineClient(ABC):
         """Finish the weight update and set its version if provided."""
         raise NotImplementedError
 
+    async def start_lora_weight_update(self, request: dict[str, Any]) -> None:
+        """Drain generation and start an IPC LoRA update."""
+        raise NotImplementedError
+
+    async def update_lora_weights(self, request: WeightTransferUpdateRequest) -> None:
+        """Receive CUDA IPC tensors for the active LoRA update."""
+        raise NotImplementedError
+
+    async def finish_lora_weight_update(self, update_id: str | None = None) -> None:
+        """Prepare and commit the LoRA update on every worker."""
+        raise NotImplementedError
+
+    async def abort_lora_weight_update(self, update_id: str | None = None) -> None:
+        """Discard the active LoRA update without resuming generation."""
+        raise NotImplementedError
+
     async def update_weight_version(self, new_version: str) -> None:
         """Set the weight version without updating weights."""
         raise NotImplementedError
