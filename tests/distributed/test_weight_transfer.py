@@ -14,6 +14,7 @@ import runpy
 import threading
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from functools import cached_property
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -2416,8 +2417,15 @@ class _ScriptedSource(WeightSource):
         yield from self._pairs
 
 
+@dataclass
+class _CPUIPCUpdateInfo(IPCWeightTransferUpdateInfo):
+    device_tag: str = "cpu-ipc"
+
+
 class _CPUIPCTrainer(IPCTrainerWeightTransferEngine):
     """Exercise the IPC extension contract on a real, non-CUDA device."""
+
+    update_info_cls = _CPUIPCUpdateInfo
 
     def _initialize_device(self) -> None:
         self.device = torch.device("cpu")
@@ -2425,6 +2433,7 @@ class _CPUIPCTrainer(IPCTrainerWeightTransferEngine):
         self.gpu_uuid = "cpu-ipc-device"
         self.exported_pointers: list[int] = []
         self.synchronizations = 0
+        self.collections = 0
 
     def _export_ipc_tensor(self, tensor: torch.Tensor) -> tuple:
         self.exported_pointers.append(tensor.data_ptr())
@@ -2433,17 +2442,81 @@ class _CPUIPCTrainer(IPCTrainerWeightTransferEngine):
     def _synchronize_device(self) -> None:
         self.synchronizations += 1
 
-    def _post_send_sync(self) -> None:
-        self._synchronize_device()
+    def _collect_ipc(self) -> None:
+        self.collections += 1
 
 
 class _CPUIPCReceiver(IPCWeightTransferEngine):
+    update_info_cls = _CPUIPCUpdateInfo
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rebuilt_pointers: list[int] = []
+
     def _get_device_uuid(self) -> str:
         return "cpu-ipc-device"
 
     def _rebuild_ipc_tensor(self, args: tuple) -> torch.Tensor:
         (tensor,) = args
+        self.rebuilt_pointers.append(tensor.data_ptr())
         return tensor.view_as(tensor)
+
+
+class _LoopbackCPUIPCTrainer(_CPUIPCTrainer):
+    def __init__(self, *, client, **kwargs):
+        super().__init__(client=client, **kwargs)
+        self.buffers = client.buffers
+
+    def _export_ipc_tensor(self, tensor: torch.Tensor) -> tuple:
+        token = tensor.data_ptr()
+        self.exported_pointers.append(token)
+        self.buffers[token] = tensor
+        return (token,)
+
+
+class _LoopbackCPUIPCReceiver(_CPUIPCReceiver):
+    def __init__(self, *args, buffers, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.buffers = buffers
+
+    def _rebuild_ipc_tensor(self, args: tuple) -> torch.Tensor:
+        (token,) = args
+        tensor = self.buffers[token]
+        self.rebuilt_pointers.append(token)
+        return tensor.view_as(tensor)
+
+
+class _LoopbackIPCClient(RecordingClient):
+    """Deliver server-bound payloads to an independently constructed receiver."""
+
+    def __init__(self, receiver):
+        super().__init__()
+        self.receiver = receiver
+        self.buffers = receiver.buffers
+        self.received: list[tuple[str, torch.Tensor]] = []
+
+    def init_weight_transfer_engine(self, init_info: dict) -> None:
+        super().init_weight_transfer_engine(init_info)
+        self.receiver.init_transfer_engine(IPCWeightTransferInitInfo(**init_info))
+
+    def update_weights(self, update_info: dict) -> None:
+        super().update_weights(update_info)
+        info = self.receiver.parse_update_info(update_info)
+        self.received.extend(self.receiver.receive_tensors(info))
+
+
+def _cpu_ipc_receiver(model=None, *, buffers=None):
+    if model is None:
+        model = torch.nn.Linear(4, 2, bias=False, device="cpu")
+    config = WeightTransferConfig(backend="plugin_ipc")
+    vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"), weight_transfer_config=config
+    )
+    if buffers is not None:
+        return _LoopbackCPUIPCReceiver(
+            config, vllm_config, torch.device("cpu"), model, buffers=buffers
+        )
+    return _CPUIPCReceiver(config, vllm_config, torch.device("cpu"), model)
 
 
 class _RecordingLoRAClient(RecordingClient):
@@ -2511,11 +2584,135 @@ def test_ipc_trainer_device_hooks_support_non_cuda_transfers(lora):
     assert engine.device == torch.device("cpu")
     assert len(engine.exported_pointers) == len(pairs)
     assert engine.synchronizations >= 1
+    assert engine.collections == 1
     assert client.last_update_info is not None
+    assert client.last_update_info["device_tag"] == "cpu-ipc"
     assert client.last_update_info["names"] == [meta.name for meta in metadata]
     for (_, original), handle in zip(pairs, client.last_update_info["ipc_handles"]):
         (exported,) = handle["cpu-ipc-device"]
         torch.testing.assert_close(exported, original, rtol=0, atol=0)
+
+
+def test_ipc_packed_device_hooks_preserve_chunks_and_release_the_mapping():
+    """Non-CUDA sends reuse one mapping while returning owned, aligned tensors."""
+    pairs = [
+        ("flag", torch.tensor([3], dtype=torch.uint8, device="cpu")),
+        ("matrix", torch.arange(4.0, device="cpu").reshape(2, 2).T),
+        ("bias", torch.arange(4.0, device="cpu") + 10),
+    ]
+    originals = [(name, tensor.clone()) for name, tensor in pairs]
+    metadata = [ParamMeta(name, tensor.dtype, tensor.shape) for name, tensor in pairs]
+    receiver = _cpu_ipc_receiver(buffers={})
+    client = _LoopbackIPCClient(receiver)
+    trainer = _LoopbackCPUIPCTrainer.trainer_init(
+        IPCTrainerInitInfo(rank=0, packed=True, packed_buffer_size_bytes=17),
+        client=client,
+        source=_ScriptedSource(metadata, pairs),
+    )
+    try:
+        trainer.send_weights()
+        assert client.order == ["init", "start", "update", "update", "finish"]
+        assert client.last_init_info == {"packed": True}
+        assert len(trainer.exported_pointers) == 1
+        assert len(receiver.rebuilt_pointers) == 1
+        assert trainer.collections == 3
+        for (expected_name, expected), (name, actual) in zip(
+            originals, client.received, strict=True
+        ):
+            assert name == expected_name
+            assert actual.dtype == expected.dtype
+            assert actual.shape == expected.shape
+            assert actual.data_ptr() != trainer.exported_pointers[0]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for (_, expected), (_, actual) in zip(originals, pairs, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        # Reading the final chunk again reuses the mapping, then shutdown releases it.
+        assert client.last_update_info is not None
+        info = receiver.parse_update_info(client.last_update_info)
+        receiver.receive_tensors(info)
+        assert len(receiver.rebuilt_pointers) == 1
+        receiver.shutdown()
+        [(name, reopened)] = receiver.receive_tensors(info)
+        assert name == "bias"
+        assert len(receiver.rebuilt_pointers) == 2
+        torch.testing.assert_close(reopened, originals[-1][1], rtol=0, atol=0)
+        client.received[-1][1].fill_(-1)
+        torch.testing.assert_close(reopened, originals[-1][1], rtol=0, atol=0)
+    finally:
+        receiver.shutdown()
+
+
+def test_ipc_packed_zero_element_tensors_preserve_their_metadata():
+    """An all-empty source still delivers its declared tensors in one chunk."""
+    pairs = [
+        ("empty_matrix", torch.empty(0, 4, dtype=torch.float32, device="cpu")),
+        ("empty_flags", torch.empty(2, 0, 3, dtype=torch.uint8, device="cpu")),
+    ]
+    metadata = [ParamMeta(name, tensor.dtype, tensor.shape) for name, tensor in pairs]
+    receiver = _cpu_ipc_receiver(buffers={})
+    client = _LoopbackIPCClient(receiver)
+    trainer = _LoopbackCPUIPCTrainer.trainer_init(
+        IPCTrainerInitInfo(rank=0, packed=True, packed_buffer_size_bytes=17),
+        client=client,
+        source=_ScriptedSource(metadata, pairs),
+    )
+    try:
+        trainer.send_weights()
+        assert client.order == ["init", "start", "update", "finish"]
+        assert len(trainer.exported_pointers) == 1
+        assert len(receiver.rebuilt_pointers) == 1
+        assert client.last_update_info is not None
+        assert client.last_update_info["names"] == [name for name, _ in pairs]
+        assert client.last_update_info["dtype_names"] == ["float32", "uint8"]
+        assert client.last_update_info["shapes"] == [[0, 4], [2, 0, 3]]
+        assert client.last_update_info["tensor_sizes"] == [0, 0]
+        for (expected_name, expected), (name, actual) in zip(
+            pairs, client.received, strict=True
+        ):
+            assert name == expected_name
+            assert actual.dtype == expected.dtype
+            assert actual.shape == expected.shape
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        receiver.shutdown()
+
+
+def test_ipc_failed_reload_releases_the_packed_mapping(monkeypatch):
+    """A real post-load failure must not retain this round's imported buffer."""
+    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+
+    class RejectingModel(torch.nn.Linear):
+        def process_weights_after_loading(self):
+            raise RuntimeError("post-load rejected the update")
+
+    monkeypatch.setenv("VLLM_RELOAD_MODE", "layerwise")
+    model = RejectingModel(2, 2, bias=False, device="cpu")
+    record_metadata_for_reloading(model)
+    receiver = _cpu_ipc_receiver(model)
+    receiver.init_transfer_engine(IPCWeightTransferInitInfo(packed=True))
+    tensor = torch.arange(4.0, device="cpu").view(torch.uint8)
+    info = IPCWeightTransferUpdateInfo(
+        names=["weight"],
+        dtype_names=["float32"],
+        shapes=[[2, 2]],
+        ipc_handles={"cpu-ipc-device": (tensor,)},
+        tensor_sizes=[16],
+    )
+    try:
+        receiver.start_weight_update()
+        receiver.receive_tensors(info)
+        assert len(receiver.rebuilt_pointers) == 1
+        with pytest.raises(RuntimeError, match="post-load rejected the update"):
+            receiver.finish_weight_update()
+        [(name, reopened)] = receiver.receive_tensors(info)
+        assert name == "weight"
+        assert len(receiver.rebuilt_pointers) == 2
+        torch.testing.assert_close(
+            reopened, tensor.view(torch.float32).reshape(2, 2), rtol=0, atol=0
+        )
+    finally:
+        receiver.shutdown()
 
 
 def test_ipc_receive_tensors_uses_device_hooks_without_loading_the_model():

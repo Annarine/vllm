@@ -9,7 +9,6 @@ from functools import cache
 from typing import Any
 
 import torch
-from torch.multiprocessing.reductions import reduce_tensor
 
 # Default values for packed tensor transfer.
 DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024  # 1GB
@@ -315,6 +314,10 @@ def packed_ipc_producer(
     gpu_uuid: str,
     post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor],
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
+    *,
+    device: torch.device | None = None,
+    export_tensor: Callable[[torch.Tensor], tuple] | None = None,
+    synchronize: Callable[[], None] | None = None,
 ) -> Iterator[PackedIpcChunk]:
     """Pack tensors into a reusable IPC buffer and yield handles.
 
@@ -334,10 +337,24 @@ def packed_ipc_producer(
         buffer_size_bytes: Exact capacity of the reusable IPC buffer.
             Every chunk is guaranteed to fit within this size.  A
             `ValueError` is raised if any single tensor exceeds it.
+        device: Device owning the reusable buffer. Defaults to the active platform.
+        export_tensor: Device-specific IPC exporter returning opaque rebuild args.
+        synchronize: Wait for queued buffer writes before publishing a chunk.
 
     """
-    ipc_buffer = torch.empty(buffer_size_bytes, dtype=torch.uint8, device="cuda")
-    _, ipc_args = reduce_tensor(ipc_buffer)
+    if buffer_size_bytes <= 0:
+        raise ValueError("buffer_size_bytes must be positive")
+    if device is None:
+        from vllm.platforms import current_platform
+
+        device = torch.device(current_platform.device_type)
+    if synchronize is None:
+        synchronize = lambda: torch.accelerator.current_stream(device).synchronize()
+    ipc_buffer = torch.empty(buffer_size_bytes, dtype=torch.uint8, device=device)
+    if export_tensor is None:
+        _, ipc_args = torch.multiprocessing.reductions.reduce_tensor(ipc_buffer)
+    else:
+        ipc_args = export_tensor(ipc_buffer)
 
     names: list[str] = []
     shapes: list[list[int]] = []
@@ -359,7 +376,7 @@ def packed_ipc_producer(
 
         if total_bytes and total_bytes + flat.numel() > buffer_size_bytes:
             # Drain queued copies so the consumer sees a fully-written buffer.
-            torch.accelerator.current_stream().synchronize()
+            synchronize()
             yield PackedIpcChunk(
                 names=names,
                 shapes=shapes,
@@ -379,8 +396,8 @@ def packed_ipc_producer(
         tensor_sizes.append(flat.numel())
         total_bytes += flat.numel()
 
-    if total_bytes:
-        torch.accelerator.current_stream().synchronize()
+    if names:
+        synchronize()
         yield PackedIpcChunk(
             names=names,
             shapes=shapes,
@@ -414,13 +431,21 @@ class PackedBufferImporter:
     def __init__(self) -> None:
         self._entry: tuple[tuple, torch.Tensor] | None = None
 
-    def rebuild(self, list_args: list) -> torch.Tensor:
-        from torch.multiprocessing.reductions import rebuild_cuda_tensor
-
+    def rebuild(
+        self,
+        list_args: list,
+        *,
+        rebuild_tensor: Callable[[tuple], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         key = tuple(list_args)
         if self._entry is not None and self._entry[0] == key:
             return self._entry[1]
-        packed = rebuild_cuda_tensor(*list_args)
+        if rebuild_tensor is None:
+            from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+            packed = rebuild_cuda_tensor(*list_args)
+        else:
+            packed = rebuild_tensor(key)
         self._entry = (key, packed)
         return packed
 
@@ -435,8 +460,11 @@ def packed_ipc_consumer(
     shapes: list[list[int]],
     dtype_names: list[str],
     tensor_sizes: list[int],
-    device_index: int,
+    device_index: int | None,
     importer: "PackedBufferImporter | None" = None,
+    *,
+    device_uuid: str | None = None,
+    rebuild_tensor: Callable[[tuple], torch.Tensor] | None = None,
 ) -> list[tuple[str, torch.Tensor]]:
     """Unpack a single packed IPC chunk into named tensors.
 
@@ -458,34 +486,69 @@ def packed_ipc_consumer(
         shapes: Parameter shapes
         dtype_names: Parameter dtype name strings (e.g. "float16")
         tensor_sizes: Size in bytes of each parameter in the packed buffer
-        device_index: Local CUDA device index
+        device_index: Receiver-local device index. A custom rebuild callback
+            may use a device without an index.
         importer: Import cache that must be shared across all chunks of one
             export so the buffer mapping is opened and released exactly once
             (see `PackedBufferImporter`). `None` builds an ephemeral one,
             which is only safe for single-chunk consumption.
+        device_uuid: Opaque physical-device key; defaults to the platform's
+            device properties, preserving the CUDA handle format.
+        rebuild_tensor: Device-specific importer, including receiver-local device
+            remapping. Use the same callback for the lifetime of an importer.
 
     """
-    props = torch.cuda.get_device_properties(device_index)
-    physical_gpu_id = str(props.uuid)
+    if (device_index is not None or rebuild_tensor is None) and (
+        not isinstance(device_index, int)
+        or isinstance(device_index, bool)
+        or device_index < 0
+    ):
+        raise ValueError("device_index must be a non-negative integer")
+    if device_uuid is None:
+        from vllm.platforms import current_platform
 
-    if physical_gpu_id not in ipc_handle:
+        device_uuid = str(current_platform.get_device_properties(device_index).uuid)
+
+    if device_uuid not in ipc_handle:
         raise ValueError(
-            f"IPC handle not found for GPU UUID {physical_gpu_id}. "
+            f"IPC handle not found for device UUID {device_uuid}. "
             f"Available UUIDs: {list(ipc_handle.keys())}"
         )
 
-    args = ipc_handle[physical_gpu_id]
+    dtypes = []
+    for dtype_name in dtype_names:
+        dtype = getattr(torch, dtype_name, None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Unknown torch dtype name {dtype_name!r}")
+        dtypes.append(dtype)
+    if not (len(names) == len(shapes) == len(dtypes) == len(tensor_sizes)):
+        raise ValueError("Packed IPC metadata lengths disagree")
+    for name, shape, dtype, size in zip(names, shapes, dtypes, tensor_sizes):
+        if any(dimension < 0 for dimension in shape) or size < 0:
+            raise ValueError(f"Invalid metadata for tensor {name!r}")
+        if size != math.prod(shape) * dtype.itemsize:
+            raise ValueError(f"Packed IPC byte size disagrees for tensor {name!r}")
+
+    args = ipc_handle[device_uuid]
     list_args = list(args)
-    list_args[6] = device_index
+    if rebuild_tensor is None:
+        if len(list_args) <= 6:
+            raise ValueError("CUDA IPC rebuild arguments do not contain a device index")
+        list_args[6] = device_index
     if importer is None:
         importer = PackedBufferImporter()
-    packed = importer.rebuild(list_args)
+    packed = importer.rebuild(list_args, rebuild_tensor=rebuild_tensor)
 
     content_size = sum(tensor_sizes)
+    if content_size > packed.numel():
+        raise ValueError("Packed IPC payload is smaller than the declared tensors")
     packed = packed[:content_size]
 
-    dtypes = [getattr(torch, dn) for dn in dtype_names]
     return [
-        (name, t.clone())
-        for name, t in unpack_tensor(packed, names, shapes, dtypes, tensor_sizes)
+        # Copy bytes before viewing the dtype: mixed-dtype chunks may place a
+        # tensor at a byte offset that is not aligned to that dtype's itemsize.
+        (name, raw.clone().view(dtype).reshape(shape))
+        for name, shape, dtype, raw in zip(
+            names, shapes, dtypes, packed.split(tensor_sizes)
+        )
     ]

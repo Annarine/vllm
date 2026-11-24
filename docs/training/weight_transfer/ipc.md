@@ -288,8 +288,9 @@ the producer's storage; the common LoRA session copies them into worker-owned
 storage before normalization. Implementing only `receive_weights()` does not
 implement this contract, because that method applies base-model weights.
 
-For an IPC subclass using the same unpacked payload, override these device
-hooks instead of copying the LoRA transfer lifecycle:
+For an IPC subclass using the same payload, override device operations instead
+of copying the transfer lifecycle. Base weights support both packed and
+unpacked transfers; LoRA updates remain unpacked-only.
 
 | Class | Hook | Plugin responsibility |
 | ----- | ---- | --------------------- |
@@ -298,7 +299,31 @@ hooks instead of copying the LoRA transfer lifecycle:
 | `IPCTrainerWeightTransferEngine` | `_initialize_device()` | Set `device`, `device_index` and `gpu_uuid`; the latter is an opaque wire identity despite its historical name |
 | `IPCTrainerWeightTransferEngine` | `_export_ipc_tensor(tensor)` | Return native reconstruction arguments for the tensor |
 | `IPCTrainerWeightTransferEngine` | `_synchronize_device()` | Complete device work before another process reads the export |
-| `IPCTrainerWeightTransferEngine` | `_post_send_sync()` | Keep trainer ranks aligned and perform native IPC cleanup after the receiver acknowledges the transfer |
+| `IPCTrainerWeightTransferEngine` | `_collect_ipc()` | Perform native IPC cleanup if needed; the default calls the device module's `ipc_collect()` when available |
+
+The default trainer uses `current_platform.device_type` for its device and
+moves ordinary checkpoint tensors with `.to(device=self.device)`. Its reducer
+is resolved when exporting each tensor, after device plugins have registered
+their native reducers. The default physical-device key still comes from the
+device module's properties, preserving existing CUDA IPC UUIDs; a plugin may
+override the identity without changing the payload schema.
+
+Packed transfers allocate on the trainer's device and use the same export,
+identity, rebuild and synchronization hooks as unpacked transfers. Rebuilding
+also remaps the receiving device through `_rebuild_ipc_tensor()`, rather than
+assuming every device uses CUDA's argument layout. The shared importer opens
+each export once across all chunks and releases it on finish or shutdown.
+Received packed tensors own their storage, so the producer can reuse its
+buffer after acknowledgement. Keep the inherited `_post_send_sync()` so its
+cross-rank barrier and device synchronization run after every packed chunk.
+
+For direct helper users, `packed_ipc_producer()` accepts `device`,
+`export_tensor` and `synchronize` keyword arguments. `packed_ipc_consumer()`
+accepts `device_uuid` and `rebuild_tensor`; pass one `PackedBufferImporter`
+across all chunks with the same rebuild callback. Omitting the callback keeps
+the existing CUDA reconstruction behavior. Trainer subclasses can set
+`update_info_cls` to extend the update dataclass without duplicating payload
+construction.
 
 Call the parent trainer constructor so the shared state that retains
 unacknowledged LoRA exports is initialized. Import a device-specific reducer
@@ -309,8 +334,9 @@ own reducer. A backend with a different wire format can override the complete
 
 For example, an Ascend subclass would initialize `device` as an NPU device,
 use its physical chip identity for the handle map, export through the native
-`torch_npu` reducer and reconstruct through `rebuild_npu_tensor`. It would also
-replace the CUDA cleanup hook with NPU synchronization. These are extension
+`torch_npu` reducer and reconstruct through `rebuild_npu_tensor`. The inherited
+post-send lifecycle would synchronize the NPU and call its cleanup hook.
+These are extension
 requirements, not an included or hardware-validated `npu_ipc` implementation.
 
 Worker subclasses that override base-model updates, sleep, or adapter
